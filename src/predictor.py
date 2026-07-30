@@ -230,7 +230,9 @@ class F1Predictor:
             circuit_type=circuit_type
         )
 
-        grid = dict(grid_positions) if grid_positions else {
+        # The feature builder already reconciled any partial grid into a
+        # complete one, so read it back rather than re-deriving it.
+        grid = {
             row['driver_id']: int(row['grid_position'])
             for _, row in prediction_features.iterrows()
         }
@@ -377,6 +379,37 @@ class F1Predictor:
         ordered = sorted(scores.items(), key=lambda item: item[1])
         return {driver_id: position for position, (driver_id, _) in enumerate(ordered, 1)}
 
+    def _resolve_grid(self,
+                      entries: List[Dict[str, str]],
+                      grid_positions: Optional[Dict[str, int]]) -> Dict[str, int]:
+        """
+        Produce a complete grid.
+
+        Known qualifying results are kept exactly as given; anyone not listed is
+        slotted into the remaining positions in estimated-pace order, so a
+        partial grid (say, just the front row) still yields a full field.
+        """
+        estimated = self._estimate_grid_positions(entries)
+
+        if not grid_positions:
+            return estimated
+
+        grid: Dict[str, int] = {}
+        taken = set()
+        for driver_id, position in grid_positions.items():
+            position = int(position)
+            grid[driver_id] = position
+            taken.add(position)
+
+        unplaced = [entry['driver_id'] for entry in entries if entry['driver_id'] not in grid]
+        unplaced.sort(key=lambda driver: estimated.get(driver, len(entries)))
+
+        free_slots = (p for p in range(1, len(entries) + 1) if p not in taken)
+        for driver_id in unplaced:
+            grid[driver_id] = next(free_slots, len(entries))
+
+        return grid
+
     def _circuit_flags(self, circuit_name: Optional[str]) -> Dict[str, int]:
         """Binary track-category flags for the circuit being predicted."""
         track_cats = self.config.get('track_categories', {})
@@ -426,7 +459,7 @@ class F1Predictor:
         history = self.training_data
         circuit_id = self._lookup_circuit_id(circuit_name)
         circuit_flags = self._circuit_flags(circuit_name)
-        grid = dict(grid_positions) if grid_positions else self._estimate_grid_positions(entries)
+        grid = self._resolve_grid(entries, grid_positions)
         rain_ratings = self.config.get('rain_performance', {})
         default_rain = rain_ratings.get('default', 0.75)
 

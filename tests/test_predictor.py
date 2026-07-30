@@ -61,6 +61,27 @@ def test_supplied_grid_positions_are_respected(predictor):
     assert pole['is_top5_grid'] == 1
 
 
+def test_a_partial_grid_is_completed_for_the_rest_of_the_field(predictor):
+    """Supplying only the front row must still produce a full, unique grid."""
+    features = predictor._build_prediction_features(
+        2026, 1, 'Bahrain', None, {'russell': 1, 'norris': 2})
+
+    by_driver = features.set_index('driver_id')['grid_position']
+    assert by_driver['russell'] == 1
+    assert by_driver['norris'] == 2
+
+    positions = sorted(features['grid_position'])
+    assert positions == [float(i) for i in range(1, len(features) + 1)]
+
+
+def test_partial_grid_is_reported_in_the_result(predictor):
+    result = predictor.predict_race(2026, 1, 'Bahrain', grid_positions={'russell': 1},
+                                    run_simulation=False)
+
+    assert set(result['grid_positions']) == set(result['adjusted_predictions'])
+    assert result['grid_positions']['russell'] == 1
+
+
 def test_grid_is_estimated_when_qualifying_is_unknown(predictor):
     features = predictor._build_prediction_features(2026, 1, 'Bahrain', None, None)
     positions = sorted(features['grid_position'])
