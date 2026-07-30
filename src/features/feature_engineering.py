@@ -130,28 +130,36 @@ class FeatureEngineer:
         # Top 10 indicator
         df['is_top10_grid'] = (df['grid_position'] <= 10).astype(int)
         
-        # Historical grid-to-finish conversion rate
-        grid_conversion = df.groupby('driver_id').apply(
-            lambda x: ((x['grid_position'] - x['finish_position'].fillna(20)) > 0).mean()
-        ).reset_index()
-        grid_conversion.columns = ['driver_id', 'grid_conversion_rate']
-        
-        df = df.merge(grid_conversion, on='driver_id', how='left')
-        df['grid_conversion_rate'] = df['grid_conversion_rate'].fillna(0.5)
-        
-        # Track-specific grid conversion
-        track_grid = df.groupby(['driver_id', 'circuit_id']).apply(
-            lambda x: ((x['grid_position'] - x['finish_position'].fillna(20)) > 0).mean()
-        ).reset_index()
-        track_grid.columns = ['driver_id', 'circuit_id', 'track_grid_conversion']
-        
-        df = df.merge(track_grid, on=['driver_id', 'circuit_id'], how='left')
-        df['track_grid_conversion'] = df['track_grid_conversion'].fillna(0.5)
-        
+        # Did the driver gain places relative to the grid in this race?
+        gained = (df['grid_position'] - df['finish_position'].fillna(20)) > 0
+        df['_gained_places'] = gained.astype(float)
+
+        # Historical grid-to-finish conversion rate.
+        # Expanding mean shifted by one race so the current result never leaks
+        # into its own feature row.
+        df['grid_conversion_rate'] = (
+            df.groupby('driver_id')['_gained_places']
+            .transform(lambda x: x.expanding().mean().shift(1))
+            .fillna(0.5)
+        )
+
+        # Track-specific grid conversion, same leak-free construction.
+        df['track_grid_conversion'] = (
+            df.groupby(['driver_id', 'circuit_id'])['_gained_places']
+            .transform(lambda x: x.expanding().mean().shift(1))
+            .fillna(df['grid_conversion_rate'])
+        )
+
+        df = df.drop(columns=['_gained_places'])
+
         return df
     
     def _engineer_track_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Engineer track-specific features."""
+        if 'position_delta' not in df.columns:
+            # Normally supplied by the data pipeline; derive it if absent.
+            df['position_delta'] = df['grid_position'] - df['finish_position'].fillna(20)
+
         # Track experience (number of races at this circuit)
         track_exp = df.groupby(['driver_id', 'circuit_id']).cumcount()
         df['track_experience'] = track_exp
@@ -163,12 +171,15 @@ class FeatureEngineer:
         df['track_historical_perf'] = track_perf.fillna(0.5)
         
         # Overtaking difficulty index (from historical data)
-        # Higher number = harder to overtake
-        overtake_idx = df.groupby('circuit_id').apply(
-            lambda x: 1 - (x['position_delta'].abs().mean() / 10)
-        ).reset_index()
+        # Higher number = harder to overtake.  This is a circuit property rather
+        # than a driver outcome, so a full-sample average is acceptable here.
+        overtake_idx = (
+            df.groupby('circuit_id')['position_delta']
+            .apply(lambda x: 1 - (x.abs().mean() / 10))
+            .reset_index()
+        )
         overtake_idx.columns = ['circuit_id', 'overtake_difficulty']
-        
+
         df = df.merge(overtake_idx, on='circuit_id', how='left')
         df['overtake_difficulty'] = df['overtake_difficulty'].fillna(0.5).clip(0, 1)
         
@@ -291,25 +302,54 @@ class FeatureEngineer:
                 lambda x: x.rolling(window=5, min_periods=1).mean().shift(1)
             )
             
-            df = df.merge(h2h_df[['year', 'round', 'driver_id', 'teammate_battle_rate']], 
+            df = df.merge(h2h_df[['year', 'round', 'driver_id', 'teammate_battle_rate']],
                          on=['year', 'round', 'driver_id'], how='left')
-        
-        df['teammate_battle_rate'] = df.get('teammate_battle_rate', 0.5).fillna(0.5)
-        
+
+        if 'teammate_battle_rate' in df.columns:
+            df['teammate_battle_rate'] = df['teammate_battle_rate'].fillna(0.5)
+        else:
+            # No complete teammate pairs in this dataset - fall back to neutral.
+            df['teammate_battle_rate'] = 0.5
+
         return df
     
+    CATEGORICAL_COLUMNS = ['driver_id', 'constructor_id', 'circuit_id', 'engine_manufacturer']
+
     def _encode_categoricals(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Encode categorical variables for ML models."""
-        categorical_cols = ['driver_id', 'constructor_id', 'circuit_id', 'engine_manufacturer']
-        
-        for col in categorical_cols:
+        """Fit label encoders on the training data and encode categoricals."""
+        for col in self.CATEGORICAL_COLUMNS:
             if col in df.columns:
                 le = LabelEncoder()
                 df[f'{col}_encoded'] = le.fit_transform(df[col].astype(str))
                 self.label_encoders[col] = le
-        
+
         return df
-    
+
+    def transform_categoricals(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Apply already-fitted label encoders to new (prediction-time) rows.
+
+        Labels never seen during training - a 2026 rookie, a renamed team, a new
+        circuit - are encoded as -1 rather than raising, so a prediction can
+        still be produced for them.
+        """
+        df = df.copy()
+
+        for col in self.CATEGORICAL_COLUMNS:
+            if col not in df.columns:
+                continue
+
+            encoder = self.label_encoders.get(col)
+            if encoder is None:
+                df[f'{col}_encoded'] = -1
+                continue
+
+            known = {label: idx for idx, label in enumerate(encoder.classes_)}
+            df[f'{col}_encoded'] = df[col].astype(str).map(known).fillna(-1).astype(int)
+
+        return df
+
+
     def get_feature_columns(self) -> List[str]:
         """Get the list of feature columns for the model."""
         return [

@@ -5,13 +5,13 @@ Merges Ergast and FastF1 data into a unified training dataset.
 
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 import logging
 import yaml
 
+from ..constants import constructor_display_name
 from .ergast_api import fetch_ergast_data, ErgastAPI
-from .fastf1_client import fetch_fastf1_data, FastF1Client
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,49 +25,79 @@ class F1DataPipeline:
     
     def __init__(self, config_path: str = "config/settings.yaml"):
         self.config = self._load_config(config_path)
-        self.ergast_api = ErgastAPI()
-        self.fastf1_client = FastF1Client()
-        
+        self.ergast_api = ErgastAPI(
+            base_url=self.config.get('data', {}).get('ergast_base_url')
+        )
+
     def _load_config(self, config_path: str) -> Dict:
         """Load configuration from YAML file."""
         try:
-            with open(config_path, 'r') as f:
-                return yaml.safe_load(f)
-        except Exception as e:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f) or {}
+        except (OSError, yaml.YAMLError) as e:
             logger.warning(f"Could not load config: {e}. Using defaults.")
             return {}
     
-    def fetch_all_data(self, years: List[int] = None) -> Dict[str, pd.DataFrame]:
+    def _resolve_years(self, years: Optional[List[int]]) -> List[int]:
+        if years:
+            return list(years)
+        return self.config.get('data', {}).get('years_to_fetch', [2023, 2024])
+
+    def _use_fastf1(self, use_fastf1: Optional[bool]) -> bool:
+        if use_fastf1 is not None:
+            return use_fastf1
+        return bool(self.config.get('data', {}).get('use_fastf1', True))
+
+    def fetch_all_data(self,
+                       years: List[int] = None,
+                       use_fastf1: Optional[bool] = None) -> Dict[str, pd.DataFrame]:
         """
-        Fetch all data from both Ergast and FastF1.
+        Fetch all data from Ergast and (optionally) FastF1.
+
+        FastF1 downloads full session telemetry and takes tens of minutes per
+        season, so it can be skipped - the pipeline degrades to the Ergast-only
+        feature set with config-based defaults for the telemetry features.
         """
-        if years is None:
-            years = self.config.get('data', {}).get('years_to_fetch', [2023, 2024])
-        
+        years = self._resolve_years(years)
         logger.info(f"Fetching data for years: {years}")
-        
-        # Fetch from both sources
-        ergast_data = fetch_ergast_data(years)
-        fastf1_data = fetch_fastf1_data(years)
-        
+
+        cache_dir = self.config.get('data', {}).get('cache_dir', './cache')
+        ergast_data = fetch_ergast_data(years, cache_dir=cache_dir, api=self.ergast_api)
+
+        if self._use_fastf1(use_fastf1):
+            # Imported lazily: fastf1 is heavy and only needed on this path.
+            from .fastf1_client import fetch_fastf1_data
+
+            fastf1_data = fetch_fastf1_data(years, cache_dir=f"{cache_dir.rstrip('/')}/fastf1")
+        else:
+            logger.info("Skipping FastF1 telemetry (data.use_fastf1 is disabled)")
+            fastf1_data = {}
+
         return {
             'ergast': ergast_data,
             'fastf1': fastf1_data,
         }
-    
-    def build_training_dataset(self, years: List[int] = None) -> pd.DataFrame:
+
+    def build_training_dataset(self,
+                               years: List[int] = None,
+                               use_fastf1: Optional[bool] = None) -> pd.DataFrame:
         """
         Build the unified training dataset.
         Each row represents a Driver-Race-Year combination with all features.
         """
-        if years is None:
-            years = self.config.get('data', {}).get('years_to_fetch', [2023, 2024])
-        
+        years = self._resolve_years(years)
+
         # Fetch raw data
-        raw_data = self.fetch_all_data(years)
+        raw_data = self.fetch_all_data(years, use_fastf1=use_fastf1)
         ergast = raw_data['ergast']
         fastf1 = raw_data['fastf1']
-        
+
+        if ergast.get('race_results') is None or ergast['race_results'].empty:
+            raise RuntimeError(
+                f"No race results returned for {years}. Check network access to "
+                f"{self.ergast_api.BASE_URL} or pick different years."
+            )
+
         # Start with race results as the base
         df = ergast['race_results'].copy()
         
@@ -195,12 +225,20 @@ class F1DataPipeline:
     
     def _merge_drs_efficiency(self, df: pd.DataFrame, drs_df: pd.DataFrame) -> pd.DataFrame:
         """Merge DRS efficiency as proxy for Active Aero capability."""
+        aero_ratings = self.config.get('active_aero_ratings', {})
+
         if drs_df.empty:
-            # Use config defaults for Active Aero ratings
-            aero_ratings = self.config.get('active_aero_ratings', {})
-            df['drs_efficiency'] = df['constructor_name'].map(aero_ratings).fillna(0.8)
+            # No telemetry: fall back to the configured Active Aero ratings,
+            # matched on the canonical team display name.
+            display_names = df['constructor_id'].map(constructor_display_name)
+            df['active_aero_efficiency'] = (
+                display_names.map(aero_ratings)
+                .fillna(df['constructor_name'].map(aero_ratings))
+                .fillna(0.8)
+            )
             return df
-        
+
+
         # Calculate team average DRS efficiency
         drs_team = drs_df.groupby(['Year', 'Team']).agg({
             'DRSSpeedGain': 'mean',

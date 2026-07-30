@@ -5,18 +5,18 @@ Complete pipeline from data to predictions.
 
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 from pathlib import Path
 import logging
+import re
 import yaml
 import json
-from datetime import datetime
 
+from src.constants import race_laps_for
 from src.data.pipeline import F1DataPipeline
-from src.data.ergast_api import ErgastAPI
-from src.data.fastf1_client import FastF1Client
 from src.features.feature_engineering import FeatureEngineer, engineer_features
-from src.models.trainer import F1ModelTrainer, train_model
+from src.models.race_updater import RaceByRaceUpdater
+from src.models.trainer import F1ModelTrainer
 from src.simulation.monte_carlo import MonteCarloSimulator
 from src.regulations.rules_2026 import Regulations2026
 
@@ -32,47 +32,69 @@ class F1Predictor:
     and 2026 regulation adjustments.
     """
     
-    def __init__(self, config_path: str = "config/settings.yaml"):
+    def __init__(self,
+                 config_path: str = "config/settings.yaml",
+                 use_elo: bool = None):
         self.config_path = config_path
         self.config = self._load_config(config_path)
-        
+
         # Initialize components
         self.pipeline = F1DataPipeline(config_path)
         self.feature_engineer = FeatureEngineer(self.config)
         self.model_trainer = F1ModelTrainer(config_path)
         self.simulator = MonteCarloSimulator(config_path)
         self.regulations = Regulations2026(config_path)
-        
+
+        elo_config = self.config.get('elo', {})
+        self.use_elo = elo_config.get('enabled', True) if use_elo is None else use_elo
+        self.race_updater = RaceByRaceUpdater(
+            elo_weight=elo_config.get('weight', 0.40),
+            k_factor_driver=elo_config.get('k_factor_driver', 20),
+            k_factor_constructor=elo_config.get('k_factor_constructor', 40),
+            ratings_path=elo_config.get('ratings_path', 'models/elo_ratings.json'),
+        )
+
         self.is_trained = False
         self.training_data: Optional[pd.DataFrame] = None
-        
+
     def _load_config(self, config_path: str) -> Dict:
-        """Load configuration."""
+        """Load configuration from YAML, falling back to built-in defaults."""
         try:
-            with open(config_path, 'r') as f:
-                return yaml.safe_load(f)
-        except:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            logger.warning(f"Config not found at {config_path}; using defaults")
             return {}
-    
-    def build_training_data(self, years: List[int] = None, save: bool = True) -> pd.DataFrame:
+        except yaml.YAMLError as exc:
+            logger.error(f"Could not parse {config_path}: {exc}; using defaults")
+            return {}
+
+
+    def build_training_data(self,
+                            years: List[int] = None,
+                            save: bool = True,
+                            use_fastf1: Optional[bool] = None) -> pd.DataFrame:
         """
         Build complete training dataset.
-        
+
         Args:
             years: Years to include in training data
             save: Whether to save the dataset
-            
+            use_fastf1: Include FastF1 telemetry features (slow); defaults to
+                the `data.use_fastf1` config value
+
         Returns:
             Training DataFrame
         """
         if years is None:
             years = self.config.get('data', {}).get('years_to_fetch', [2022, 2023, 2024, 2025])
-        
+
         logger.info(f"Building training data for years: {years}")
-        
+
         # Fetch and merge data
-        df = self.pipeline.build_training_dataset(years)
-        
+        df = self.pipeline.build_training_dataset(years, use_fastf1=use_fastf1)
+
+
         # Engineer features
         df, self.feature_engineer = engineer_features(df, self.config)
         
@@ -176,13 +198,28 @@ class F1Predictor:
         driver_predictions = {}
         driver_uncertainties = {}
         constructor_map = {}
-        
-        for i, row in prediction_features.iterrows():
+        driver_names = {}
+
+        for i, (_, row) in enumerate(prediction_features.iterrows()):
             driver = row['driver_id']
-            driver_predictions[driver] = predictions[i]
-            driver_uncertainties[driver] = uncertainties[i]
+            driver_predictions[driver] = float(predictions[i])
+            driver_uncertainties[driver] = float(uncertainties[i])
             constructor_map[driver] = row['constructor_id']
-        
+            driver_names[driver] = row.get('driver_name', driver)
+
+        # Blend in Elo form before the regulation layer, so the 2026 adjustments
+        # apply to the combined ML + form view rather than the raw model output.
+        elo_predictions = None
+        if self.use_elo:
+            blended, blended_unc = self.race_updater.blend_predictions(
+                driver_predictions,
+                driver_uncertainties,
+                constructor_map,
+                circuit=circuit_name,
+            )
+            elo_predictions = dict(driver_predictions)
+            driver_predictions, driver_uncertainties = blended, blended_unc
+
         # Apply 2026 adjustments
         circuit_type = self._get_circuit_type(circuit_name)
         adjusted = self.regulations.adjust_predictions_for_2026(
@@ -192,23 +229,35 @@ class F1Predictor:
             race_number=round_num,
             circuit_type=circuit_type
         )
-        
+
+        grid = dict(grid_positions) if grid_positions else {
+            row['driver_id']: int(row['grid_position'])
+            for _, row in prediction_features.iterrows()
+        }
+
         result = {
             'year': year,
             'round': round_num,
             'circuit': circuit_name,
             'circuit_type': circuit_type,
-            'raw_predictions': driver_predictions,
+            'drivers': driver_names,
+            'constructors': constructor_map,
+            'grid_positions': grid,
+            'raw_predictions': elo_predictions if elo_predictions is not None else driver_predictions,
+            'blended_predictions': driver_predictions,
             'adjusted_predictions': adjusted['predictions'],
             'uncertainties': adjusted['uncertainties'],
             '2026_adjustments': adjusted['adjustments'],
+            'elo_weight': (self.race_updater.elo_weight
+                           if self.use_elo and self.race_updater.has_ratings else 0.0),
         }
-        
+
         # Run Monte Carlo simulation
         if run_simulation:
-            grid = grid_positions or {d: i+1 for i, d in enumerate(adjusted['predictions'].keys())}
-            reliability = self._get_reliability_scores(list(adjusted['predictions'].keys()))
-            
+            reliability = self._get_reliability_scores(
+                list(adjusted['predictions'].keys()), constructor_map
+            )
+
             mc_results = self.simulator.run_monte_carlo(
                 adjusted['predictions'],
                 adjusted['uncertainties'],
@@ -222,6 +271,7 @@ class F1Predictor:
             result['monte_carlo'] = {
                 'win_probabilities': mc_results['win_probabilities'],
                 'podium_probabilities': mc_results['podium_probabilities'],
+                'points_probabilities': mc_results['points_probabilities'],
                 'expected_positions': mc_results['expected_positions'],
                 'position_std': mc_results['position_std'],
                 'dnf_probabilities': mc_results['dnf_probability'],
@@ -235,79 +285,265 @@ class F1Predictor:
         
         return result
     
+    # Sensible neutral values used when a feature cannot be derived from
+    # history for a given driver (rookies, renamed teams, new circuits).
+    FEATURE_DEFAULTS = {
+        'grid_position': 10.0,
+        'driver_form': 0.5,
+        'form_trend': 0.0,
+        'driver_consistency': 0.2,
+        'constructor_form': 10.0,
+        'grid_conversion_rate': 0.5,
+        'track_grid_conversion': 0.5,
+        'track_experience': 0.0,
+        'track_historical_perf': 0.5,
+        'overtake_difficulty': 0.5,
+        'rain_skill': 0.75,
+        'weather_adjusted_skill': 0.5,
+        'temp_deg_factor': 0.0,
+        'pit_efficiency': 1.0,
+        'pit_consistency': 0.8,
+        'reliability_score': 0.9,
+        'avg_deg_per_lap_pct': 0.0,
+        'season_avg_deg': 0.0,
+        'active_aero_efficiency': 0.8,
+        'teammate_battle_rate': 0.5,
+        'historical_weight': 0.4,
+    }
+
+    def _default_feature_value(self, column: str) -> float:
+        """Neutral fallback for a feature column."""
+        if column in self.FEATURE_DEFAULTS:
+            return self.FEATURE_DEFAULTS[column]
+        if column.endswith('_encoded'):
+            return -1.0
+        if column.startswith('is_'):
+            return 0.0
+        if 'rate' in column or 'score' in column:
+            return 0.5
+        return 0.0
+
+    def _resolve_grid_entries(self,
+                              year: int,
+                              drivers: Optional[List[str]]) -> List[Dict[str, str]]:
+        """
+        Work out which driver/constructor pairs to predict for.
+
+        Preference order:
+          1. the explicit ``drivers`` argument,
+          2. the most recent season present in the loaded training data,
+          3. the confirmed 2026 entry list.
+        """
+        entries: List[Dict[str, str]] = []
+
+        if self.training_data is not None and not self.training_data.empty:
+            history = self.training_data
+            latest_season = history[history['year'] == history['year'].max()]
+            latest = latest_season.groupby('driver_id').last().reset_index()
+
+            for _, row in latest.iterrows():
+                entries.append({
+                    'driver_id': row['driver_id'],
+                    'driver_code': row.get('driver_code') or str(row['driver_id'])[:3].upper(),
+                    'driver_name': row.get('driver_name') or row['driver_id'],
+                    'constructor_id': row.get('constructor_id', 'unknown'),
+                    'constructor_name': row.get('constructor_name', 'Unknown'),
+                })
+
+        if not entries:
+            entries = self.regulations.get_2026_grid_entries()
+
+        if drivers:
+            wanted = {d.lower() for d in drivers}
+            filtered = [e for e in entries if e['driver_id'].lower() in wanted]
+
+            # Any requested driver missing from history still gets an entry so
+            # the caller always receives a prediction for what they asked for.
+            known = {e['driver_id'].lower() for e in filtered}
+            lineup_2026 = {e['driver_id'].lower(): e
+                           for e in self.regulations.get_2026_grid_entries()}
+            for driver in drivers:
+                key = driver.lower()
+                if key in known:
+                    continue
+                filtered.append(lineup_2026.get(key, {
+                    'driver_id': driver,
+                    'driver_code': driver[:3].upper(),
+                    'driver_name': driver,
+                    'constructor_id': 'unknown',
+                    'constructor_name': 'Unknown',
+                }))
+            entries = filtered
+
+        return entries
+
+    def _estimate_grid_positions(self, entries: List[Dict[str, str]]) -> Dict[str, int]:
+        """
+        Estimate a starting grid when qualifying results are not supplied.
+
+        Drivers are ranked by their average historical grid position where that
+        is known, and by 2026 pre-season/opening-round pace where it is not.
+        """
+        history = self.training_data
+        scores: Dict[str, float] = {}
+
+        for entry in entries:
+            driver_id = entry['driver_id']
+            score = None
+
+            if history is not None and not history.empty and 'grid_position' in history.columns:
+                driver_rows = history[history['driver_id'] == driver_id]
+                if not driver_rows.empty:
+                    mean_grid = driver_rows['grid_position'].tail(10).mean()
+                    if pd.notna(mean_grid):
+                        score = float(mean_grid)
+
+            if score is None:
+                # Lower rating = further back, so invert into a pseudo grid slot.
+                team_name = self.regulations.get_constructor_display_name(
+                    entry.get('constructor_id', '')
+                )
+                rating = self.regulations.testing_data.get_testing_performance_rating(team_name)
+                score = 21.0 - rating * 20.0
+
+            scores[driver_id] = score
+
+        ordered = sorted(scores.items(), key=lambda item: item[1])
+        return {driver_id: position for position, (driver_id, _) in enumerate(ordered, 1)}
+
+    def _circuit_flags(self, circuit_name: Optional[str]) -> Dict[str, int]:
+        """Binary track-category flags for the circuit being predicted."""
+        track_cats = self.config.get('track_categories', {})
+        name = (circuit_name or '').lower()
+
+        flags = {
+            f'is_{category}': int(any(track.lower() in name for track in tracks))
+            for category, tracks in track_cats.items()
+        }
+        flags['is_power_track'] = flags.get('is_power_hungry', 0)
+        return flags
+
+    def _lookup_circuit_id(self, circuit_name: Optional[str]) -> str:
+        """Best-effort mapping from a circuit name to its historical id."""
+        if not circuit_name:
+            return 'unknown'
+
+        history = self.training_data
+        if history is not None and 'circuit_id' in history.columns:
+            name = circuit_name.lower()
+            matches = history[
+                history['circuit_name'].astype(str).str.lower().str.contains(name, regex=False)
+                | history['circuit_id'].astype(str).str.lower().str.contains(name, regex=False)
+            ]
+            if not matches.empty:
+                return str(matches.iloc[-1]['circuit_id'])
+
+        return circuit_name.lower().replace(' ', '_')
+
     def _build_prediction_features(self,
                                    year: int,
                                    round_num: int,
                                    circuit_name: str,
                                    drivers: List[str],
                                    grid_positions: Dict[str, int]) -> pd.DataFrame:
-        """Build feature DataFrame for prediction."""
-        # Get latest driver/team data
-        if self.training_data is not None:
-            latest_data = self.training_data[
-                self.training_data['year'] == self.training_data['year'].max()
-            ]
-        else:
-            # Fetch latest data
-            api = ErgastAPI()
-            latest_data = api.get_race_results(year - 1)
-        
-        # Get unique driver-constructor pairs
-        if drivers is None:
-            driver_teams = latest_data.groupby('driver_id').last()[
-                ['constructor_id', 'constructor_name', 'driver_code', 'driver_name']
-            ].reset_index()
-        else:
-            driver_teams = latest_data[latest_data['driver_id'].isin(drivers)].groupby('driver_id').last()[
-                ['constructor_id', 'constructor_name', 'driver_code', 'driver_name']
-            ].reset_index()
-        
-        # Build prediction rows
+        """
+        Build the feature DataFrame the model scores for an upcoming race.
+
+        Each driver's most recent engineered feature row is carried forward, then
+        the race-specific values (grid slot, circuit flags) are overwritten.
+        """
+        entries = self._resolve_grid_entries(year, drivers)
+        if not entries:
+            raise ValueError("No drivers available to predict. Provide `drivers` explicitly.")
+
+        feature_columns = self.feature_engineer.get_feature_columns()
+        history = self.training_data
+        circuit_id = self._lookup_circuit_id(circuit_name)
+        circuit_flags = self._circuit_flags(circuit_name)
+        grid = dict(grid_positions) if grid_positions else self._estimate_grid_positions(entries)
+        rain_ratings = self.config.get('rain_performance', {})
+        default_rain = rain_ratings.get('default', 0.75)
+
         rows = []
-        for _, dt in driver_teams.iterrows():
-            row = {
-                'driver_id': dt['driver_id'],
-                'driver_code': dt.get('driver_code', dt['driver_id'][:3].upper()),
-                'driver_name': dt.get('driver_name', dt['driver_id']),
-                'constructor_id': dt['constructor_id'],
-                'constructor_name': dt['constructor_name'],
+        for entry in entries:
+            driver_id = entry['driver_id']
+
+            row: Dict[str, Any] = {
+                'driver_id': driver_id,
+                'driver_code': entry['driver_code'],
+                'driver_name': entry['driver_name'],
+                'constructor_id': entry['constructor_id'],
+                'constructor_name': entry['constructor_name'],
+                'circuit_id': circuit_id,
+                'circuit_name': circuit_name or 'Unknown',
                 'year': year,
                 'round': round_num,
-                'circuit_name': circuit_name or 'Unknown',
             }
-            
-            # Add grid position if available
-            if grid_positions and dt['driver_id'] in grid_positions:
-                row['grid_position'] = grid_positions[dt['driver_id']]
-            else:
-                row['grid_position'] = len(driver_teams) // 2  # Mid-grid default
-            
-            # Get driver's historical features from training data
-            if self.training_data is not None:
-                driver_history = self.training_data[
-                    self.training_data['driver_id'] == dt['driver_id']
-                ]
+
+            # Carry forward the driver's latest engineered features.
+            if history is not None and not history.empty:
+                driver_history = history[history['driver_id'] == driver_id]
                 if not driver_history.empty:
-                        latest = driver_history.iloc[-1]
-        
+                    latest = driver_history.iloc[-1]
+                    for column in feature_columns:
+                        if column in latest.index and pd.notna(latest[column]):
+                            row[column] = latest[column]
+
+                    # Track experience is cumulative, so advance it by one race.
+                    track_rows = driver_history[driver_history['circuit_id'] == circuit_id]
+                    row['track_experience'] = float(len(track_rows))
+                    if not track_rows.empty and 'track_historical_perf' in track_rows.columns:
+                        value = track_rows.iloc[-1]['track_historical_perf']
+                        if pd.notna(value):
+                            row['track_historical_perf'] = value
+
+            # Race-specific values always win over carried-forward history.
+            row.update(circuit_flags)
+            row['grid_position'] = float(grid.get(driver_id, len(entries)))
+            row['is_front_row'] = int(row['grid_position'] <= 2)
+            row['is_top5_grid'] = int(row['grid_position'] <= 5)
+            row['is_top10_grid'] = int(row['grid_position'] <= 10)
+            row['rain_skill'] = rain_ratings.get(entry['driver_code'], default_rain)
+            row['historical_weight'] = self.config.get(
+                'regulations_2026', {}
+            ).get('historical_weight_decay', {}).get(year, 0.4)
+
+            rows.append(row)
+
         df = pd.DataFrame(rows)
-        
-        # Fill missing features
-        for col in self.feature_engineer.get_feature_columns():
-            if col not in df.columns:
-                df[col] = 0.5 if 'rate' in col or 'score' in col else 0
-        
+        df = self.feature_engineer.transform_categoricals(df)
+
+        # Guarantee every model input exists and is finite.
+        for column in feature_columns:
+            default = self._default_feature_value(column)
+            if column not in df.columns:
+                df[column] = default
+            else:
+                df[column] = pd.to_numeric(df[column], errors='coerce').fillna(default)
+
         return df
-    
+
     def _prepare_prediction_input(self, df: pd.DataFrame) -> np.ndarray:
-        """Prepare feature matrix for prediction."""
-        feature_cols = [c for c in self.model_trainer.feature_columns if c in df.columns]
-        X = df[feature_cols].copy()
-        X = X.fillna(X.mean())
-        X = X.replace([np.inf, -np.inf], 0)
-        X = X.fillna(0)
-        return X.values
-    
+        """Prepare the feature matrix, column-aligned with the trained model."""
+        expected = self.model_trainer.feature_columns
+        if not expected:
+            raise ValueError("Trained model has no feature columns recorded.")
+
+        X = pd.DataFrame(index=df.index)
+        for column in expected:
+            if column in df.columns:
+                X[column] = pd.to_numeric(df[column], errors='coerce')
+            else:
+                logger.warning(f"Feature '{column}' missing at prediction time; using default")
+                X[column] = self._default_feature_value(column)
+
+        X = X.replace([np.inf, -np.inf], np.nan)
+        for column in expected:
+            X[column] = X[column].fillna(self._default_feature_value(column))
+
+        return X.values.astype(float)
+
+
     def _get_circuit_type(self, circuit_name: str) -> str:
         """Determine circuit type from name."""
         if circuit_name is None:
@@ -321,177 +557,176 @@ class F1Predictor:
         
         return 'normal'
     
-    def _get_reliability_scores(self, drivers: List[str]) -> Dict[str, float]:
-        """Get reliability scores for drivers."""
-        if self.training_data is not None:
-            reliability = self.training_data.groupby('constructor_id')['reliability_score'].mean().to_dict()
-        else:
-            reliability = {}
-        
-        # Map drivers to their team's reliability
+    def _get_reliability_scores(self,
+                                drivers: List[str],
+                                constructor_map: Dict[str, str] = None) -> Dict[str, float]:
+        """
+        Reliability (1 - DNF rate) per driver, taken from their team.
+
+        Prefers the 2026 team reliability table in the config, then the DNF rate
+        observed in the training data, then a neutral default.
+        """
+        constructor_map = constructor_map or {}
+
+        config_reliability = self.config.get('team_reliability_2026', {})
+
+        historical: Dict[str, float] = {}
+        history = self.training_data
+        if history is not None and 'reliability_score' in history.columns:
+            historical = history.groupby('constructor_id')['reliability_score'].mean().to_dict()
+
         driver_reliability = {}
         for driver in drivers:
-            # Default high reliability
-            driver_reliability[driver] = reliability.get(driver, 0.92)
-        
+            constructor_id = constructor_map.get(driver, '')
+            display_name = self.regulations.get_constructor_display_name(constructor_id)
+
+            score = config_reliability.get(display_name)
+            if score is None:
+                score = historical.get(constructor_id)
+            if score is None or not np.isfinite(score):
+                score = 0.92
+
+            driver_reliability[driver] = float(np.clip(score, 0.5, 1.0))
+
         return driver_reliability
-    
+
+
     def _get_race_laps(self, circuit_name: str) -> int:
         """Get number of race laps for a circuit."""
-        # Default race laps by circuit
-        lap_counts = {
-            'bahrain': 57,
-            'jeddah': 50,
-            'melbourne': 58,
-            'suzuka': 53,
-            'monaco': 78,
-            'canada': 70,
-            'silverstone': 52,
-            'spa': 44,
-            'monza': 53,
-            'singapore': 62,
-            'austin': 56,
-            'las vegas': 50,
-            'abu dhabi': 58,
-        }
-        
-        if circuit_name:
-            for key, laps in lap_counts.items():
-                if key in circuit_name.lower():
-                    return laps
-        
-        return 57  # Default
-    
+        return race_laps_for(circuit_name)
+
+    def update_after_race(self,
+                          results: pd.DataFrame,
+                          circuit: str,
+                          round_num: int) -> pd.DataFrame:
+        """
+        Fold a completed race into the Elo ratings.
+
+        Args:
+            results: DataFrame with `driver_id`, `constructor_id`, `position`
+                and optionally `quali_position` and `dnf`.
+            circuit: Circuit name.
+            round_num: Round number within the season.
+
+        Returns:
+            The updated rating table.
+        """
+        required = {'driver_id', 'constructor_id', 'position'}
+        missing = required - set(results.columns)
+        if missing:
+            raise ValueError(f"Race results are missing required columns: {sorted(missing)}")
+
+        self.race_updater.update_from_race(results, circuit=circuit, race_number=round_num)
+        return self.race_updater.get_rating_summary()
+
+    def get_elo_standings(self) -> pd.DataFrame:
+        """Current Elo ratings for drivers and constructors."""
+        return self.race_updater.get_rating_summary()
+
     def format_predictions(self, results: Dict[str, Any]) -> str:
         """Format prediction results for display."""
+        names = results.get('drivers', {})
+        constructors = results.get('constructors', {})
+        grid = results.get('grid_positions', {})
+
+        def label(driver_id: str) -> str:
+            name = names.get(driver_id, driver_id)
+            team = constructors.get(driver_id)
+            if team:
+                return f"{name} ({self.regulations.get_constructor_display_name(team)})"
+            return str(name)
+
         output = []
-        output.append("=" * 70)
-        output.append(f"F1 2026 Race Prediction: {results.get('circuit', 'Unknown')}")
-        output.append(f"Round {results['round']} | Circuit Type: {results['circuit_type']}")
-        output.append("=" * 70)
-        
+        output.append("=" * 78)
+        output.append(f"F1 {results['year']} Race Prediction: {results.get('circuit') or 'Unknown'}")
+        output.append(f"Round {results['round']} | Circuit Type: {results['circuit_type']}"
+                      + (f" | Elo weight: {results['elo_weight']:.0%}"
+                         if results.get('elo_weight') else ""))
+        output.append("=" * 78)
+
         if 'monte_carlo' in results:
             mc = results['monte_carlo']
-            
+
             # Sort by expected position
             sorted_drivers = sorted(
                 mc['expected_positions'].items(),
                 key=lambda x: x[1]
             )
-            
-            output.append("\n{:4} {:20} {:>10} {:>10} {:>10} {:>8}".format(
-                "Pos", "Driver", "Win %", "Podium %", "Exp Pos", "±Std"
+
+            output.append("\n{:4} {:32} {:>5} {:>9} {:>10} {:>9} {:>7}".format(
+                "Pos", "Driver", "Grid", "Win %", "Podium %", "Exp Pos", "+/-Std"
             ))
-            output.append("-" * 70)
-            
+            output.append("-" * 78)
+
             for i, (driver, exp_pos) in enumerate(sorted_drivers, 1):
                 win_pct = mc['win_probabilities'].get(driver, 0) * 100
                 podium_pct = mc['podium_probabilities'].get(driver, 0) * 100
                 std = mc['position_std'].get(driver, 0)
-                
-                output.append("{:4} {:20} {:>9.1f}% {:>9.1f}% {:>10.1f} {:>7.1f}".format(
-                    i, driver, win_pct, podium_pct, exp_pos, std
+                grid_slot = grid.get(driver, '-')
+
+                output.append("{:<4} {:32} {:>5} {:>8.1f}% {:>9.1f}% {:>9.1f} {:>7.1f}".format(
+                    i, label(driver)[:32], grid_slot, win_pct, podium_pct, exp_pos, std
                 ))
-            
+
             # Confidence intervals
             if 'confidence_intervals' in results:
-                output.append("\n90% Confidence Intervals:")
-                output.append("-" * 40)
+                output.append("\n90% Confidence Intervals (top 10):")
+                output.append("-" * 50)
                 for driver, (low, high) in sorted(
                     results['confidence_intervals'].items(),
                     key=lambda x: results['monte_carlo']['expected_positions'][x[0]]
                 )[:10]:
-                    output.append(f"  {driver}: P{low} - P{high}")
+                    output.append(f"  {label(driver):40} P{low} - P{high}")
         else:
             # Simple predictions
             sorted_preds = sorted(
                 results['adjusted_predictions'].items(),
                 key=lambda x: x[1]
             )
-            
+
             output.append("\nPredicted Order:")
             for i, (driver, pos) in enumerate(sorted_preds, 1):
-                output.append(f"  {i}. {driver} (predicted: {pos:.1f})")
-        
+                output.append(f"  {i:2}. {label(driver):40} (predicted: {pos:.1f})")
+
         return "\n".join(output)
-    
-    def save_predictions(self, results: Dict[str, Any], path: str = "predictions/"):
-        """Save predictions to file."""
+
+
+    @staticmethod
+    def _to_jsonable(obj: Any) -> Any:
+        """Recursively convert numpy scalars/arrays into JSON-safe values."""
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        if isinstance(obj, dict):
+            return {str(k): F1Predictor._to_jsonable(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [F1Predictor._to_jsonable(v) for v in obj]
+        return obj
+
+    def save_predictions(self, results: Dict[str, Any], path: str = "predictions/") -> Path:
+        """
+        Write prediction results to a JSON file.
+
+        The full position distributions are dropped - they are megabytes of
+        simulation detail that the summary statistics already capture.
+        """
         output_dir = Path(path)
         output_dir.mkdir(parents=True, exist_ok=True)
-        
-        filename = f"{results['year']}_R{results['round']}_{results.get('circuit', 'race')}.json"
-        filepath = output_dir / filename
-        
-        # Convert numpy types to Python types
-        def convert_types(obj):
-            if isinstance(obj, np.ndarray):
-                return obj.tolist()
-            elif isinstance(obj, (np.int64, np.int32)):
-                return int(obj)
-            elif isinstance(obj, (np.float64, np.float32)):
-                return float(obj)
-            elif isinstance(obj, dict):
-                return {k: convert_types(v) for k, v in obj.items()}
-            elif isinstance(obj, list):
-                return [convert_types(v) for v in obj]
-            return obj
-        
-        clean_results = convert_types(results)
-        
-        with open(filepath, 'w') as f:
+
+        circuit = results.get('circuit') or 'race'
+        safe_circuit = re.sub(r'[^A-Za-z0-9._-]+', '_', str(circuit)).strip('_') or 'race'
+        filepath = output_dir / f"{results['year']}_R{results['round']}_{safe_circuit}.json"
+
+        payload = {k: v for k, v in results.items() if k != 'position_distributions'}
+        clean_results = self._to_jsonable(payload)
+
+        with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(clean_results, f, indent=2)
-        
+
         logger.info(f"Predictions saved to {filepath}")
-
-
-def main():
-    """Main entry point for the predictor."""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="F1 2026 Race Predictor")
-    parser.add_argument('--train', action='store_true', help='Train the model')
-    parser.add_argument('--predict', action='store_true', help='Make predictions')
-    parser.add_argument('--year', type=int, default=2026, help='Prediction year')
-    parser.add_argument('--round', type=int, default=1, help='Round number')
-    parser.add_argument('--circuit', type=str, default=None, help='Circuit name')
-    parser.add_argument('--simulations', type=int, default=10000, help='MC simulations')
-    
-    args = parser.parse_args()
-    
-    predictor = F1Predictor()
-    
-    if args.train:
-        # Build training data and train
-        print("Building training data...")
-        df = predictor.build_training_data(years=[2022, 2023, 2024, 2025])
-        
-        print("Training model...")
-        metrics = predictor.train(df, model_type='xgboost')
-        
-        print(f"\nTraining complete!")
-        print(f"MAE: {metrics['mae']:.3f}")
-        print(f"Within ±2 positions: {metrics['within_2_positions']*100:.1f}%")
-    
-    if args.predict:
-        # Load model if not trained
-        if not predictor.is_trained:
-            predictor.load_model()
-        
-        # Make prediction
-        results = predictor.predict_race(
-            year=args.year,
-            round_num=args.round,
-            circuit_name=args.circuit,
-            n_simulations=args.simulations
-        )
-        
-        # Display results
-        print(predictor.format_predictions(results))
-        
-        # Save
-        predictor.save_predictions(results)
-
-
-if __name__ == "__main__":
-    main()
+        return filepath

@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Tuple
 import logging
 from pathlib import Path
 
+from src.constants import constructor_display_name
 from src.models.elo_updater import F1EloRatingSystem
 
 logger = logging.getLogger(__name__)
@@ -29,7 +30,11 @@ class RaceByRaceUpdater:
     - Blend both for final prediction
     """
 
-    def __init__(self, elo_weight: float = 0.40):
+    def __init__(self,
+                 elo_weight: float = 0.40,
+                 k_factor_driver: float = 20,
+                 k_factor_constructor: float = 40,
+                 ratings_path: str = "models/elo_ratings.json"):
         """
         Initialize updater.
 
@@ -37,20 +42,29 @@ class RaceByRaceUpdater:
             elo_weight: How much to trust Elo vs ML (0.4 = 40% Elo, 60% ML)
                        Early season: increase Elo weight
                        Mid season: decrease Elo weight
+            k_factor_driver: Elo learning rate for drivers
+            k_factor_constructor: Elo learning rate for constructors
+            ratings_path: Where persisted ratings live
         """
         self.elo_system = F1EloRatingSystem(
-            k_factor_driver=20,
-            k_factor_constructor=40
+            k_factor_driver=k_factor_driver,
+            k_factor_constructor=k_factor_constructor
         )
 
+        self.ratings_path = ratings_path
         self.elo_weight = elo_weight
         self.ml_weight = 1.0 - elo_weight
+        self.has_ratings = False
 
         # Try to load existing ratings
-        try:
-            self.elo_system.load_ratings()
-            logger.info("Loaded existing Elo ratings")
-        except:
+        if Path(ratings_path).exists():
+            try:
+                self.elo_system.load_ratings(ratings_path)
+                self.has_ratings = bool(self.elo_system.constructor_ratings)
+                logger.info(f"Loaded Elo ratings from {ratings_path}")
+            except (OSError, ValueError, KeyError) as exc:
+                logger.warning(f"Could not read Elo ratings at {ratings_path}: {exc}")
+        else:
             logger.info("No existing Elo ratings found, starting fresh")
 
     def update_from_race(self,
@@ -73,6 +87,11 @@ class RaceByRaceUpdater:
         """
         logger.info(f"Updating ratings from {circuit} (Race {race_number})")
 
+        # Ratings are keyed by display name, so normalise whichever vocabulary
+        # the caller used (`red_bull` vs `Red Bull Racing`).
+        results = results.copy()
+        results['constructor_id'] = results['constructor_id'].map(constructor_display_name)
+
         # Update Elo ratings
         self.elo_system.update_from_race_result(
             results,
@@ -93,7 +112,8 @@ class RaceByRaceUpdater:
         self.ml_weight = 1.0 - self.elo_weight
 
         # Save updated ratings
-        self.elo_system.save_ratings()
+        self.elo_system.save_ratings(self.ratings_path)
+        self.has_ratings = True
 
         logger.info(f"Ratings updated. Current Elo weight: {self.elo_weight:.1%}")
 
@@ -147,15 +167,18 @@ class RaceByRaceUpdater:
         Returns:
             (blended_predictions, blended_uncertainties)
         """
-        # Get Elo-based predictions
-        driver_pairs = [
-            (driver, constructor)
-            for driver, constructor in driver_constructor_map.items()
-        ]
+        if not self.has_ratings:
+            # With no rating history every driver sits on the initial Elo, so an
+            # Elo-derived order would be arbitrary. Pass the ML view straight
+            # through rather than injecting noise.
+            logger.info("No Elo history available; returning ML predictions unblended")
+            return dict(ml_predictions), dict(ml_uncertainties)
 
         elo_ratings = {
-            driver: self.elo_system.get_combined_rating(driver, constructor, circuit)
-            for driver, constructor in driver_pairs
+            driver: self.elo_system.get_combined_rating(
+                driver, constructor_display_name(constructor), circuit
+            )
+            for driver, constructor in driver_constructor_map.items()
         }
 
         # Convert Elo ratings to predicted positions
@@ -208,7 +231,8 @@ class RaceByRaceUpdater:
             Dict of driver -> win probability
         """
         return self.elo_system.get_win_probabilities(
-            driver_constructor_pairs,
+            [(driver, constructor_display_name(constructor))
+             for driver, constructor in driver_constructor_pairs],
             circuit=circuit
         )
 
@@ -250,7 +274,9 @@ class RaceByRaceUpdater:
         - reliability
         """
         driver_rating = self.elo_system.get_driver_rating(driver)
-        constructor_rating = self.elo_system.get_constructor_rating(constructor)
+        constructor_rating = self.elo_system.get_constructor_rating(
+            constructor_display_name(constructor)
+        )
 
         # Driver rating affects overtake/mistake probability
         # High rating (>1600) = better overtaking, fewer mistakes

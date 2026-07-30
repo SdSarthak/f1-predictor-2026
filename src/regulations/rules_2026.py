@@ -8,6 +8,8 @@ import numpy as np
 from typing import Dict, List, Optional, Any
 import yaml
 import logging
+
+from src.constants import GRID_2026, TEAM_ENGINE_2026, constructor_display_name
 from src.data.testing_data_2026 import Testing2026Data
 
 logging.basicConfig(level=logging.INFO)
@@ -32,19 +34,9 @@ class Regulations2026:
         self.testing_data = Testing2026Data()
         
         # 2026 Team-Engine mapping
-        self.team_engine_2026 = {
-            'red_bull': 'Red Bull Powertrains-Ford',
-            'mercedes': 'Mercedes',
-            'ferrari': 'Ferrari',
-            'mclaren': 'Mercedes',
-            'aston_martin': 'Honda',
-            'alpine': 'Renault',
-            'williams': 'Mercedes',
-            'rb': 'Honda',
-            'sauber': 'Audi',  # Becoming Audi in 2026
-            'haas': 'Ferrari',
-        }
-        
+        self.team_engine_2026 = dict(TEAM_ENGINE_2026)
+
+
         # Historical DRS performance as Active Aero baseline
         self.active_aero_baseline = self.config.get('active_aero_ratings', {
             'Red Bull Racing': 0.95,
@@ -261,7 +253,29 @@ class Regulations2026:
             'Haas': ['Esteban Ocon', 'Ollie Bearman'],
         }
     
-    def calculate_2026_team_uncertainty(self, 
+    def get_constructor_display_name(self, constructor_id: str) -> str:
+        """Map a constructor id onto the display name used by lookup tables."""
+        return constructor_display_name(constructor_id)
+
+    def get_2026_grid_entries(self) -> List[Dict[str, str]]:
+        """
+        Full 2026 entry list as records.
+
+        Used as the fallback driver set when no historical data is available
+        for the season being predicted.
+        """
+        return [
+            {
+                'driver_id': driver_id,
+                'driver_code': code,
+                'driver_name': name,
+                'constructor_id': constructor_id,
+                'constructor_name': self.get_constructor_display_name(constructor_id),
+            }
+            for driver_id, code, name, constructor_id in GRID_2026
+        ]
+
+    def calculate_2026_team_uncertainty(self,
                                         constructor_id: str,
                                         race_number: int = 1) -> Dict[str, float]:
         """
@@ -280,21 +294,8 @@ class Regulations2026:
         # Teams with new drivers have higher uncertainty
         driver_uncertainty = 1.0
         lineup = self.get_2026_driver_lineup()
-        
-        constructor_name_map = {
-            'red_bull': 'Red Bull Racing',
-            'mercedes': 'Mercedes',
-            'ferrari': 'Ferrari',
-            'mclaren': 'McLaren',
-            'aston_martin': 'Aston Martin',
-            'alpine': 'Alpine',
-            'williams': 'Williams',
-            'rb': 'RB',
-            'sauber': 'Audi (Sauber)',
-            'haas': 'Haas',
-        }
-        
-        team_name = constructor_name_map.get(constructor_id.lower(), constructor_id)
+
+        team_name = self.get_constructor_display_name(constructor_id)
         team_drivers = lineup.get(team_name, ['TBD', 'TBD'])
         
         # Count TBD drivers
@@ -381,19 +382,7 @@ class Regulations2026:
             pu_adjustment = (pu_profile['combined_pu_score'] - 0.85) * 2  # Scale around average
             
             # Active aero effect
-            constructor_name_map = {
-                'red_bull': 'Red Bull Racing',
-                'mercedes': 'Mercedes',
-                'ferrari': 'Ferrari',
-                'mclaren': 'McLaren',
-                'aston_martin': 'Aston Martin',
-                'alpine': 'Alpine',
-                'williams': 'Williams',
-                'rb': 'RB',
-                'sauber': 'Kick Sauber',
-                'haas': 'Haas',
-            }
-            team_name = constructor_name_map.get(constructor.lower(), constructor)
+            team_name = self.get_constructor_display_name(constructor)
             aero_score = self.calculate_active_aero_efficiency(team_name)
             aero_adjustment = (aero_score - 0.85) * 1.5
 

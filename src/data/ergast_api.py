@@ -22,16 +22,31 @@ logger = logging.getLogger(__name__)
 class ErgastAPI:
     """Client for the Ergast F1 API (using Jolpica-F1 mirror since Ergast shut down in 2024)."""
 
-    BASE_URL = "https://api.jolpi.ca/ergast/f1"
-    
-    def __init__(self, cache_enabled: bool = True):
+    DEFAULT_BASE_URL = "https://api.jolpi.ca/ergast/f1"
+    # Public mirror; overridable per-instance or via the F1_ERGAST_BASE_URL env var.
+    BASE_URL = DEFAULT_BASE_URL
+
+    def __init__(self,
+                 cache_enabled: bool = True,
+                 base_url: Optional[str] = None,
+                 request_delay: float = 3.0):
         self.cache_enabled = cache_enabled
+        self.base_url = (base_url
+                         or os.environ.get('F1_ERGAST_BASE_URL')
+                         or self.DEFAULT_BASE_URL).rstrip('/')
+        self.request_delay = request_delay
         self._cache: Dict = {}
-        
+
+    # The Jolpica mirror silently clamps `limit` to 100, so every collection
+    # endpoint has to be paged rather than pulled in one request.
+    PAGE_SIZE = 100
+    MAX_PAGES = 60
+
     @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=2, min=4, max=30))
-    def _make_request(self, endpoint: str, limit: int = 1000) -> Dict:
-        """Make API request with retry logic and rate limiting."""
-        url = f"{self.BASE_URL}/{endpoint}.json?limit={limit}"
+    def _make_request(self, endpoint: str, limit: int = None, offset: int = 0) -> Dict:
+        """Fetch a single page with retry logic and rate limiting."""
+        limit = self.PAGE_SIZE if limit is None else limit
+        url = f"{self.base_url}/{endpoint}.json?limit={limit}&offset={offset}"
 
         if self.cache_enabled and url in self._cache:
             return self._cache[url]
@@ -43,10 +58,60 @@ class ErgastAPI:
         if self.cache_enabled:
             self._cache[url] = data
 
-        # Rate limiting - increased delay for Jolpica-F1 API to avoid 429 errors
-        time.sleep(3.0)
+        # Rate limiting - Jolpica-F1 returns 429 without a delay between calls
+        if self.request_delay:
+            time.sleep(self.request_delay)
         return data
-    
+
+    def _paginate(self, endpoint: str):
+        """Yield every MRData page for an endpoint until `total` is exhausted."""
+        offset = 0
+        for _ in range(self.MAX_PAGES):
+            data = self._make_request(endpoint, limit=self.PAGE_SIZE, offset=offset)
+            yield data
+
+            mrdata = data.get('MRData', {})
+            total = int(mrdata.get('total', 0))
+            offset += self.PAGE_SIZE
+            if offset >= total:
+                return
+
+        logger.warning(f"Stopped paging {endpoint} after {self.MAX_PAGES} pages")
+
+    def _fetch_races(self, endpoint: str, results_key: Optional[str] = None) -> List[Dict]:
+        """
+        Fetch every race object for an endpoint, stitching paged results back
+        together. A single race's results can straddle a page boundary, so
+        consecutive entries for the same season/round are merged.
+        """
+        races: List[Dict] = []
+
+        for page in self._paginate(endpoint):
+            for race in page.get('MRData', {}).get('RaceTable', {}).get('Races', []):
+                same_race = (
+                    races
+                    and races[-1].get('season') == race.get('season')
+                    and races[-1].get('round') == race.get('round')
+                )
+                if same_race and results_key:
+                    races[-1].setdefault(results_key, []).extend(race.get(results_key, []))
+                elif not same_race:
+                    races.append(race)
+
+        return races
+
+    def _fetch_standings(self, endpoint: str, standings_key: str) -> List[Dict]:
+        """Fetch a full standings table, stitching pages back together."""
+        entries: List[Dict] = []
+
+        for page in self._paginate(endpoint):
+            lists = page.get('MRData', {}).get('StandingsTable', {}).get('StandingsLists', [])
+            for standings_list in lists:
+                entries.extend(standings_list.get(standings_key, []))
+
+        return entries
+
+
     def get_race_results(self, year: int, round_num: Optional[int] = None) -> pd.DataFrame:
         """
         Fetch race results for a given year.
@@ -56,10 +121,9 @@ class ErgastAPI:
             endpoint = f"{year}/{round_num}/results"
         else:
             endpoint = f"{year}/results"
-            
-        data = self._make_request(endpoint)
-        races = data['MRData']['RaceTable']['Races']
-        
+
+        races = self._fetch_races(endpoint, 'Results')
+
         results = []
         for race in races:
             race_info = {
@@ -71,7 +135,7 @@ class ErgastAPI:
                 'date': race['date']
             }
             
-            for result in race['Results']:
+            for result in race.get('Results', []):
                 row = {
                     **race_info,
                     'driver_id': result['Driver']['driverId'],
@@ -97,10 +161,9 @@ class ErgastAPI:
             endpoint = f"{year}/{round_num}/qualifying"
         else:
             endpoint = f"{year}/qualifying"
-            
-        data = self._make_request(endpoint)
-        races = data['MRData']['RaceTable']['Races']
-        
+
+        races = self._fetch_races(endpoint, 'QualifyingResults')
+
         results = []
         for race in races:
             race_info = {
@@ -126,12 +189,12 @@ class ErgastAPI:
     def get_pit_stops(self, year: int, round_num: int) -> pd.DataFrame:
         """Fetch pit stop data for a specific race."""
         endpoint = f"{year}/{round_num}/pitstops"
-        data = self._make_request(endpoint)
-        
-        races = data['MRData']['RaceTable']['Races']
+        races = self._fetch_races(endpoint, 'PitStops')
+
         if not races:
             return pd.DataFrame()
-            
+
+
         race = races[0]
         pit_stops = race.get('PitStops', [])
         
@@ -180,15 +243,10 @@ class ErgastAPI:
     
     def get_driver_standings(self, year: int) -> pd.DataFrame:
         """Get driver championship standings."""
-        endpoint = f"{year}/driverStandings"
-        data = self._make_request(endpoint)
-        
-        standings_list = data['MRData']['StandingsTable']['StandingsLists']
-        if not standings_list:
+        standings = self._fetch_standings(f"{year}/driverStandings", 'DriverStandings')
+        if not standings:
             return pd.DataFrame()
-            
-        standings = standings_list[0]['DriverStandings']
-        
+
         results = []
         for standing in standings:
             results.append({
@@ -205,15 +263,10 @@ class ErgastAPI:
     
     def get_constructor_standings(self, year: int) -> pd.DataFrame:
         """Get constructor championship standings."""
-        endpoint = f"{year}/constructorStandings"
-        data = self._make_request(endpoint)
-        
-        standings_list = data['MRData']['StandingsTable']['StandingsLists']
-        if not standings_list:
+        standings = self._fetch_standings(f"{year}/constructorStandings", 'ConstructorStandings')
+        if not standings:
             return pd.DataFrame()
-            
-        standings = standings_list[0]['ConstructorStandings']
-        
+
         results = []
         for standing in standings:
             results.append({
@@ -229,11 +282,8 @@ class ErgastAPI:
     
     def get_race_schedule(self, year: int) -> pd.DataFrame:
         """Get the race calendar for a year."""
-        endpoint = f"{year}"
-        data = self._make_request(endpoint)
-        
-        races = data['MRData']['RaceTable']['Races']
-        
+        races = self._fetch_races(f"{year}")
+
         results = []
         for race in races:
             results.append({
@@ -255,11 +305,10 @@ class ErgastAPI:
         Get race status data for reliability analysis.
         Used to calculate DNF rates per engine manufacturer.
         """
-        endpoint = f"{year}/status"
-        data = self._make_request(endpoint)
-        
-        status_list = data['MRData']['StatusTable']['Status']
-        
+        status_list = []
+        for page in self._paginate(f"{year}/status"):
+            status_list.extend(page.get('MRData', {}).get('StatusTable', {}).get('Status', []))
+
         results = []
         for status in status_list:
             results.append({
@@ -304,7 +353,9 @@ class ErgastAPI:
         return reliability.reset_index()
 
 
-def fetch_ergast_data(years: List[int], cache_dir: str = "./cache") -> Dict[str, pd.DataFrame]:
+def fetch_ergast_data(years: List[int],
+                      cache_dir: str = "./cache",
+                      api: Optional[ErgastAPI] = None) -> Dict[str, pd.DataFrame]:
     """
     Main function to fetch all Ergast data for training.
     Returns dictionary of DataFrames with disk caching support.
@@ -325,7 +376,7 @@ def fetch_ergast_data(years: List[int], cache_dir: str = "./cache") -> Dict[str,
             logger.warning(f"Failed to load cache: {e}. Fetching fresh data...")
 
     # Fetch fresh data
-    api = ErgastAPI(cache_enabled=True)
+    api = api or ErgastAPI(cache_enabled=True)
 
     all_data = {
         'race_results': [],

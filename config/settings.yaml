@@ -2,10 +2,14 @@
 
 # Data Collection Settings
 data:
-  years_to_fetch: [2021, 2022, 2023, 2024, 2025]  # Training data years
+  years_to_fetch: [2022, 2023, 2024, 2025]  # Training data years
   cache_dir: "./cache"
   ergast_base_url: "https://api.jolpi.ca/ergast/f1"  # Using Jolpica-F1 (Ergast mirror)
-  
+  # FastF1 downloads full session telemetry: tens of minutes per season on a
+  # cold cache. Off by default; enable here or with `--telemetry` on the CLI.
+  use_fastf1: false
+
+
 # 2026 Regulation Adjustments
 regulations_2026:
   # Weight reduction impact (-30kg from 2025)
@@ -79,6 +83,14 @@ model:
     max_depth: 12
     min_samples_split: 5
     min_samples_leaf: 2
+
+# Elo Rating System (race-by-race form tracking)
+elo:
+  enabled: true
+  weight: 0.40              # 40% Elo / 60% ML when blending predictions
+  k_factor_driver: 20       # Driver skill moves slowly
+  k_factor_constructor: 40  # Car performance moves faster
+  ratings_path: "models/elo_ratings.json"
 
 # Monte Carlo Simulation Settings
 monte_carlo:

@@ -267,27 +267,32 @@ class F1ModelTrainer:
             raise ValueError("Model not trained. Call train() first.")
         
         X_scaled = self.scaler.transform(X)
-        
-        if hasattr(self.model, 'estimators_'):
-            # For ensemble models, use individual estimator predictions
-            all_preds = []
-            for name, estimator in self.model.named_estimators_.items():
-                preds = estimator.predict(X_scaled)
-                all_preds.append(preds)
-            
-            all_preds = np.array(all_preds)
+
+        if isinstance(self.model, VotingRegressor):
+            # Spread across the ensemble members is the uncertainty signal.
+            all_preds = np.array([
+                estimator.predict(X_scaled)
+                for estimator in self.model.named_estimators_.values()
+            ])
+            predictions = all_preds.mean(axis=0)
+            std = all_preds.std(axis=0)
+        elif isinstance(self.model, RandomForestRegressor):
+            # Spread across the individual trees.
+            all_preds = np.array([tree.predict(X_scaled) for tree in self.model.estimators_])
             predictions = all_preds.mean(axis=0)
             std = all_preds.std(axis=0)
         elif isinstance(self.model, xgb.XGBRegressor):
-            # For XGBoost, use iterations
+            # Boosted trees are deterministic, so perturb the inputs instead.
             predictions = self.model.predict(X_scaled)
-            
-            # Approximate uncertainty using feature perturbation
             std = self._estimate_uncertainty_perturbation(X_scaled, n_samples)
         else:
             predictions = self.model.predict(X_scaled)
             std = np.ones(len(predictions)) * 1.5  # Default uncertainty
-        
+
+        # A degenerate (zero) spread makes the Monte Carlo stage deterministic,
+        # so keep a small floor on the reported uncertainty.
+        std = np.maximum(np.asarray(std, dtype=float), 0.25)
+
         return np.clip(predictions, 1, 20), std
     
     def _estimate_uncertainty_perturbation(self, X: np.ndarray, n_samples: int = 50) -> np.ndarray:
