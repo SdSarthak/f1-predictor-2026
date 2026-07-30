@@ -6,7 +6,7 @@ Fetches telemetry, lap times, weather data, and session information.
 import fastf1
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from pathlib import Path
 import logging
 from datetime import datetime
@@ -23,7 +23,7 @@ class FastF1Client:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         fastf1.Cache.enable_cache(str(self.cache_dir))
         
-    def get_session(self, year: int, race: str | int, session_type: str = 'R') -> fastf1.core.Session:
+    def get_session(self, year: int, race: Union[str, int], session_type: str = 'R') -> fastf1.core.Session:
         """
         Load a session.
         session_type: 'R' (Race), 'Q' (Qualifying), 'FP1', 'FP2', 'FP3', 'S' (Sprint)
@@ -32,7 +32,7 @@ class FastF1Client:
         session.load()
         return session
     
-    def get_lap_data(self, year: int, race: str | int, session_type: str = 'R') -> pd.DataFrame:
+    def get_lap_data(self, year: int, race: Union[str, int], session_type: str = 'R') -> pd.DataFrame:
         """
         Get detailed lap data for a session.
         Includes lap times, tire compounds, sector times, etc.
@@ -106,7 +106,7 @@ class FastF1Client:
                 
         return pd.DataFrame(degradation_data)
     
-    def get_weather_data(self, year: int, race: str | int, session_type: str = 'R') -> pd.DataFrame:
+    def get_weather_data(self, year: int, race: Union[str, int], session_type: str = 'R') -> pd.DataFrame:
         """
         Get weather data for a session.
         Includes air temp, track temp, humidity, rainfall, wind.
@@ -140,7 +140,7 @@ class FastF1Client:
             logger.error(f"Failed to get weather data for {year} {race}: {e}")
             return pd.DataFrame()
     
-    def get_telemetry_for_driver(self, year: int, race: str | int, 
+    def get_telemetry_for_driver(self, year: int, race: Union[str, int], 
                                   driver: str, lap_number: int = None) -> pd.DataFrame:
         """
         Get detailed telemetry for a specific driver.
@@ -148,7 +148,7 @@ class FastF1Client:
         """
         try:
             session = self.get_session(year, race, 'R')
-            driver_laps = session.laps.pick_driver(driver)
+            driver_laps = session.laps.pick_drivers(driver)
             
             if lap_number:
                 lap = driver_laps[driver_laps['LapNumber'] == lap_number].iloc[0]
@@ -162,7 +162,7 @@ class FastF1Client:
             logger.error(f"Failed to get telemetry for {driver} at {year} {race}: {e}")
             return pd.DataFrame()
     
-    def calculate_drs_efficiency(self, year: int, race: str | int) -> pd.DataFrame:
+    def calculate_drs_efficiency(self, year: int, race: Union[str, int]) -> pd.DataFrame:
         """
         Calculate DRS efficiency for each driver.
         Measures speed gain in DRS zones - proxy for Active Aero in 2026.
@@ -172,7 +172,7 @@ class FastF1Client:
             
             drs_data = []
             for driver in session.laps['Driver'].unique():
-                driver_laps = session.laps.pick_driver(driver)
+                driver_laps = session.laps.pick_drivers(driver)
                 
                 # Get fastest lap with DRS usage
                 valid_laps = driver_laps[driver_laps['IsAccurate'] == True]
@@ -202,9 +202,10 @@ class FastF1Client:
                                 'DRSUsagePct': drs_usage_pct,
                                 'AvgSpeedWithDRS': avg_speed_with_drs,
                             })
-                except:
+                except Exception as exc:
+                    logger.debug(f"No usable DRS telemetry for {driver}: {exc}")
                     continue
-                    
+
             return pd.DataFrame(drs_data)
             
         except Exception as e:
@@ -220,7 +221,7 @@ class FastF1Client:
             logger.error(f"Failed to get schedule for {year}: {e}")
             return pd.DataFrame()
     
-    def get_overtaking_data(self, year: int, race: str | int) -> pd.DataFrame:
+    def get_overtaking_data(self, year: int, race: Union[str, int]) -> pd.DataFrame:
         """
         Analyze position changes to calculate overtaking difficulty.
         """

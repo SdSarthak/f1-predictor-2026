@@ -490,4 +490,4 @@ if __name__ == "__main__":
 
     # Save ratings
     elo.save_ratings()
-    print("\n✅ Ratings saved to models/elo_ratings.json")
+    print("\nRatings saved to models/elo_ratings.json")

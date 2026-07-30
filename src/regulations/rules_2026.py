@@ -52,11 +52,12 @@ class Regulations2026:
         })
         
     def _load_config(self, config_path: str) -> Dict:
-        """Load configuration."""
+        """Load configuration, falling back to the built-in 2026 baselines."""
         try:
-            with open(config_path, 'r') as f:
-                return yaml.safe_load(f)
-        except:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            logger.warning(f"Could not load {config_path}: {exc}. Using defaults.")
             return {}
     
     def apply_historical_weight_decay(self, df: pd.DataFrame) -> pd.DataFrame:

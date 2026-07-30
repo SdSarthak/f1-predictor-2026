@@ -294,11 +294,16 @@ class RaceByRaceUpdater:
         }
 
 
-def create_updater_from_australia_gp() -> RaceByRaceUpdater:
+def create_updater_from_australia_gp(
+        ratings_path: str = "models/elo_ratings.json") -> RaceByRaceUpdater:
     """
     Create updater pre-initialized with Australia GP 2026 data.
+
+    Args:
+        ratings_path: Where the resulting ratings are written. Point this at a
+            scratch file to avoid overwriting the project's ratings.
     """
-    updater = RaceByRaceUpdater(elo_weight=0.40)
+    updater = RaceByRaceUpdater(elo_weight=0.40, ratings_path=ratings_path)
 
     # Australia GP results (qualifying - replace with race when available)
     australia_results = pd.DataFrame([
@@ -338,7 +343,8 @@ if __name__ == "__main__":
 
     print("Creating race-by-race updater with Australia GP data...\n")
 
-    updater = create_updater_from_australia_gp()
+    # Demo run: write to a scratch file so the project's ratings are untouched.
+    updater = create_updater_from_australia_gp(ratings_path="models/elo_ratings.demo.json")
 
     print("=== CONSTRUCTOR POWER RANKINGS ===")
     rankings = updater.get_constructor_power_rankings()
@@ -383,7 +389,7 @@ if __name__ == "__main__":
         unc = uncertainties[driver]
         impact = blend_pos - ml_pos
 
-        print(f"{driver:15} P{ml_pos:4.1f}     {impact:+5.1f}       P{blend_pos:4.1f}      ±{unc:.2f}")
+        print(f"{driver:15} P{ml_pos:4.1f}     {impact:+5.1f}       P{blend_pos:4.1f}      +/-{unc:.2f}")
 
-    print("\nKey insight: Elo pulls Hadjar up 6 positions, Verstappen down 9!")
-    print("Antonelli gets boost (rookie performing well)")
+    print("\nThe 'Elo Impact' column is how far recent form moved each driver")
+    print("away from the raw model output.")

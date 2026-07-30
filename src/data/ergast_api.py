@@ -219,7 +219,7 @@ class ErgastAPI:
                 parts = duration_str.split(':')
                 return float(parts[0]) * 60 + float(parts[1])
             return float(duration_str)
-        except:
+        except (TypeError, ValueError):
             return np.nan
     
     def get_all_pit_stops(self, year: int) -> pd.DataFrame:

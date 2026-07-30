@@ -36,11 +36,12 @@ class MonteCarloSimulator:
         self.num_simulations = self.mc_config.get('num_simulations', 10000)
         
     def _load_config(self, config_path: str) -> Dict:
-        """Load configuration."""
+        """Load configuration, falling back to the built-in event probabilities."""
         try:
-            with open(config_path, 'r') as f:
-                return yaml.safe_load(f)
-        except:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            logger.warning(f"Could not load {config_path}: {exc}. Using defaults.")
             return {}
     
     def simulate_race(self, 
