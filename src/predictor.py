@@ -285,43 +285,9 @@ class F1Predictor:
         
         return result
     
-    # Sensible neutral values used when a feature cannot be derived from
-    # history for a given driver (rookies, renamed teams, new circuits).
-    FEATURE_DEFAULTS = {
-        'grid_position': 10.0,
-        'driver_form': 0.5,
-        'form_trend': 0.0,
-        'driver_consistency': 0.2,
-        'constructor_form': 10.0,
-        'grid_conversion_rate': 0.5,
-        'track_grid_conversion': 0.5,
-        'track_experience': 0.0,
-        'track_historical_perf': 0.5,
-        'overtake_difficulty': 0.5,
-        'rain_skill': 0.75,
-        'weather_adjusted_skill': 0.5,
-        'temp_deg_factor': 0.0,
-        'pit_efficiency': 1.0,
-        'pit_consistency': 0.8,
-        'reliability_score': 0.9,
-        'avg_deg_per_lap_pct': 0.0,
-        'season_avg_deg': 0.0,
-        'active_aero_efficiency': 0.8,
-        'teammate_battle_rate': 0.5,
-        'historical_weight': 0.4,
-    }
-
     def _default_feature_value(self, column: str) -> float:
-        """Neutral fallback for a feature column."""
-        if column in self.FEATURE_DEFAULTS:
-            return self.FEATURE_DEFAULTS[column]
-        if column.endswith('_encoded'):
-            return -1.0
-        if column.startswith('is_'):
-            return 0.0
-        if 'rate' in column or 'score' in column:
-            return 0.5
-        return 0.0
+        """Neutral fallback for a feature column (shared with the engineer)."""
+        return FeatureEngineer.default_for(column)
 
     def _resolve_grid_entries(self,
                               year: int,

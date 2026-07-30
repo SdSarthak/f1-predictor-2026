@@ -56,7 +56,65 @@ class FeatureEngineer:
         
         # Encode categorical variables
         df = self._encode_categoricals(df)
-        
+
+        # Guarantee a stable schema: telemetry-derived columns are absent when
+        # FastF1 is skipped, and the model must still see the same inputs.
+        df = self.ensure_feature_columns(df)
+
+        return df
+
+    # Neutral values for every declared feature, used whenever a column cannot
+    # be derived from the available data.
+    FEATURE_DEFAULTS = {
+        'grid_position': 10.0,
+        'driver_form': 0.5,
+        'form_trend': 0.0,
+        'driver_consistency': 0.2,
+        'constructor_form': 10.0,
+        'grid_conversion_rate': 0.5,
+        'track_grid_conversion': 0.5,
+        'track_experience': 0.0,
+        'track_historical_perf': 0.5,
+        'overtake_difficulty': 0.5,
+        'rain_skill': 0.75,
+        'weather_adjusted_skill': 0.5,
+        'temp_deg_factor': 0.0,
+        'pit_efficiency': 1.0,
+        'pit_consistency': 0.8,
+        'reliability_score': 0.9,
+        'avg_deg_per_lap_pct': 0.0,
+        'season_avg_deg': 0.0,
+        'active_aero_efficiency': 0.8,
+        'teammate_battle_rate': 0.5,
+        'historical_weight': 0.4,
+    }
+
+    @classmethod
+    def default_for(cls, column: str) -> float:
+        """Neutral fallback value for a feature column."""
+        if column in cls.FEATURE_DEFAULTS:
+            return cls.FEATURE_DEFAULTS[column]
+        if column.endswith('_encoded'):
+            return -1.0
+        if column.startswith('is_'):
+            return 0.0
+        if 'rate' in column or 'score' in column:
+            return 0.5
+        return 0.0
+
+    def ensure_feature_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Create any missing feature column and make every value finite."""
+        for column in self.get_feature_columns():
+            default = self.default_for(column)
+
+            if column not in df.columns:
+                logger.debug(f"Feature '{column}' unavailable; defaulting to {default}")
+                df[column] = default
+                continue
+
+            values = pd.to_numeric(df[column], errors='coerce')
+            df[column] = values.replace([np.inf, -np.inf], np.nan).fillna(default)
+
         return df
     
     def _calculate_driver_form(self, df: pd.DataFrame, window: int = 5) -> pd.DataFrame:

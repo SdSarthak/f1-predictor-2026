@@ -49,5 +49,7 @@ Thumbs.db
 *.ckpt
 *.onnx
 
-# Keep the checked-in Elo seed ratings
+# Keep the checked-in Elo seed ratings and the sample race result
 !models/elo_ratings.json
+!examples/
+!examples/*.csv

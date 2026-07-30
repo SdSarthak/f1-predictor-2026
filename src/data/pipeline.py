@@ -184,6 +184,8 @@ class F1DataPipeline:
         """Merge tire degradation data."""
         if deg_df.empty:
             df['avg_deg_per_lap_pct'] = np.nan
+            df['avg_deg_slope'] = np.nan
+            df['season_avg_deg'] = np.nan
             return df
         
         # Calculate average degradation per driver per race
