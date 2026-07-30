@@ -1,0 +1,240 @@
+# F1 Race Predictor 2026 Configuration
+
+# Data Collection Settings
+data:
+  years_to_fetch: [2021, 2022, 2023, 2024, 2025]  # Training data years
+  cache_dir: "./cache"
+  ergast_base_url: "https://api.jolpi.ca/ergast/f1"  # Using Jolpica-F1 (Ergast mirror)
+  
+# 2026 Regulation Adjustments
+regulations_2026:
+  # Weight reduction impact (-30kg from 2025)
+  weight_reduction_kg: 30
+  
+  # Power unit split (50% Electric / 50% ICE)
+  electric_power_percentage: 50
+  
+  # New engine manufacturers with uncertainty
+  new_engine_manufacturers:
+    - name: "Audi"
+      uncertainty_multiplier: 1.25
+      uncertainty_races: 5
+    - name: "Red Bull Powertrains-Ford"
+      uncertainty_multiplier: 1.15
+      uncertainty_races: 5
+      
+  # Historical constructor weight reduction (2026 is reset year)
+  historical_weight_decay:
+    2025: 0.4  # 40% weight
+    2024: 0.3  # 30% weight  
+    2023: 0.2  # 20% weight
+    2022: 0.1  # 10% weight (used as regulation change proxy)
+
+# Track Categories
+track_categories:
+  high_speed:
+    - "Monza"
+    - "Spa-Francorchamps"
+    - "Jeddah"
+    - "Baku"
+  high_downforce:
+    - "Monaco"
+    - "Singapore"
+    - "Hungary"
+    - "Zandvoort"
+  street_circuit:
+    - "Monaco"
+    - "Singapore"
+    - "Baku"
+    - "Jeddah"
+    - "Las Vegas"
+    - "Miami"
+  power_hungry:  # Critical for 2026's 50/50 power split
+    - "Monza"
+    - "Spa-Francorchamps"
+    - "Silverstone"
+    - "Bahrain"
+
+# Model Settings
+model:
+  type: "xgboost"  # Options: xgboost, random_forest, ensemble
+  test_size: 0.2
+  random_state: 42
+  cv_folds: 5
+  
+  # XGBoost hyperparameters
+  xgboost:
+    n_estimators: 500
+    max_depth: 6
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+    min_child_weight: 3
+    reg_alpha: 0.1
+    reg_lambda: 1.0
+    
+  # Random Forest hyperparameters
+  random_forest:
+    n_estimators: 300
+    max_depth: 12
+    min_samples_split: 5
+    min_samples_leaf: 2
+
+# Monte Carlo Simulation Settings
+monte_carlo:
+  num_simulations: 10000
+  
+  # Random event probabilities (per race)
+  safety_car_probability: 0.35
+  red_flag_probability: 0.08
+  
+  # DNF probabilities by cause
+  dnf_probabilities:
+    mechanical_failure: 0.03
+    collision: 0.05
+    driver_error: 0.02
+    
+  # First lap chaos factor
+  first_lap_incident_probability: 0.15
+
+# Feature Weights for 2026 (Updated after Australia GP)
+# Australia GP showed: reliability critical (VER/SAI/STR DNS), active aero huge, rookies strong
+feature_weights:
+  reliability_score: 0.22        # INCREASED - 3 DNS in quali, VER crash, critical in 2026
+  active_aero_efficiency: 0.18   # INCREASED - Mercedes dominated with aero, huge gaps
+  grid_position: 0.20            # DECREASED - still important but not everything
+  driver_skill: 0.15             # DECREASED - rookies outperforming (ANT P2, HAD P3)
+  power_unit_profile: 0.10       # INCREASED - 50/50 split showing impact
+  tire_degradation: 0.08         # DECREASED - less critical in qualifying focus
+  pit_stop_efficiency: 0.05      # DECREASED - not yet seen in season
+  weather_performance: 0.02      # DECREASED - dry conditions so far
+
+# Active Aero Baseline Ratings (Updated from Australia GP 2026 qualifying)
+# Mercedes dominated with 1-2, Ferrari/McLaren strong, Red Bull struggled
+active_aero_ratings:
+  Mercedes: 0.98          # Dominant in Australia - Russell pole by 0.3s
+  McLaren: 0.92           # Strong pace - Piastri P5, Norris P6
+  Ferrari: 0.91           # Competitive - Leclerc P4, Hamilton P7
+  RB: 0.88                # Surprisingly good - Hadjar P3(!), Lindblad P8, Lawson P9
+  Red Bull Racing: 0.85   # Struggled - Verstappen crashed, reliability issues
+  Haas: 0.82              # Solid midfield - Bearman P12, Ocon P13
+  Alpine: 0.80            # Lower midfield - Gasly P14, Colapinto P16
+  Audi (Sauber): 0.79     # Better than testing - Bortoleto P10, Hulkenberg P11
+  Williams: 0.76          # Struggled - Albon P15, Sainz DNS
+  Aston Martin: 0.70      # Major issues - Alonso P17, Stroll DNS
+  Kick Sauber: 0.75       # Fallback for historical data
+
+# Driver Performance Adjustments (2026 Season - Australia GP Data)
+# Position adjustment: negative = better, positive = worse
+driver_performance_adjustments_2026:
+  # Rookies performing above expectations
+  ANT: -0.8  # Antonelli - P2 in qualifying, exceptional debut
+  HAD: -1.2  # Hadjar - P3 in qualifying, shocking performance for RB
+  BOR: -0.5  # Bortoleto - P10 in qualifying, beat teammate, impressive
+  LIN: -0.3  # Lindblad - P8 in qualifying, solid RB performance
+
+  # Veterans with issues/penalties
+  VER: +1.5  # Verstappen - crashed in Q1, rear brake lock issue, reliability concern
+  ALO: +0.8  # Alonso - P17, struggling with new Aston Martin
+  STR: +1.2  # Stroll - DNS, technical issues
+  SAI: +0.9  # Sainz - DNS, ERS issues at Williams
+
+  # Drivers exceeding expectations
+  RUS: -0.4  # Russell - Pole position, dominant
+  PIA: -0.3  # Piastri - P5, strong home performance
+
+  # Drivers underperforming
+  NOR: +0.2  # Norris - P6, expected better from defending champion
+  HAM: +0.1  # Hamilton - P7, slower than Leclerc at Ferrari
+
+# Driver Rain Performance Ratings (0-1 scale)
+rain_performance:
+  # Elite rain performers
+  VER: 0.95  # Verstappen
+  HAM: 0.94  # Hamilton
+  ALO: 0.92  # Alonso
+  NOR: 0.88  # Norris
+  LEC: 0.85  # Leclerc
+  RUS: 0.84  # Russell
+  PIA: 0.82  # Piastri
+  SAI: 0.80  # Sainz
+
+  # 2026 Experienced drivers
+  HUL: 0.83  # Hulkenberg (veteran, good in wet)
+  GAS: 0.81  # Gasly
+  OCO: 0.78  # Ocon
+  TSU: 0.76  # Tsunoda
+  STR: 0.72  # Stroll
+  ALB: 0.80  # Albon
+
+  # 2026 Rookies/Young drivers (less proven in wet)
+  ANT: 0.70  # Antonelli (rookie, potential unknown)
+  BOR: 0.68  # Bortoleto (rookie)
+  BEA: 0.72  # Bearman (limited experience)
+  DOO: 0.70  # Doohan (rookie)
+  HAD: 0.69  # Hadjar (rookie)
+  LAW: 0.74  # Lawson (some F1 experience)
+
+  # Default for others
+  default: 0.75
+
+# 2026 Power Unit Performance (Updated from Australia GP)
+# Based on qualifying pace and reliability from Melbourne
+power_unit_performance_2026:
+  Mercedes:
+    reliability: 0.98    # Perfect reliability, 1-2 finish in quali
+    power: 0.96          # Dominant pace, 0.3s advantage
+    efficiency: 0.95     # No issues with 50/50 power split
+
+  Ferrari:
+    reliability: 0.94    # Good reliability, both cars in top 7
+    power: 0.92          # Strong pace, competitive with McLaren
+    efficiency: 0.93     # Solid deployment management
+
+  Mercedes-Customer:  # McLaren, Williams
+    reliability: 0.96    # McLaren solid (P5/P6), Williams had ERS issue
+    power: 0.94          # McLaren showed strong pace
+    efficiency: 0.93     # Generally good except Williams ERS
+
+  Honda:  # RB (formerly AlphaTauri/Racing Bulls)
+    reliability: 0.95    # Excellent - all 3 drivers qualified well
+    power: 0.90          # Surprising pace - Hadjar P3!
+    efficiency: 0.92     # Good energy deployment
+
+  Red Bull Powertrains-Ford:
+    reliability: 0.75    # POOR - Verstappen crashed due to brake/PU issue
+    power: 0.88          # Unknown pace due to crash
+    efficiency: 0.82     # Brake lock suggests deployment issues
+
+  Renault:  # Alpine
+    reliability: 0.89    # Both cars ran but lower midfield
+    power: 0.84          # Slower pace - P14/P16
+    efficiency: 0.86     # Decent but not competitive
+
+  Ferrari-Customer:  # Haas
+    reliability: 0.93    # Good reliability, both in Q2
+    power: 0.90          # Solid midfield pace
+    efficiency: 0.91     # Good performance
+
+  Audi:
+    reliability: 0.82    # Bortoleto breakdown in Q3, Hulkenberg gremlins
+    power: 0.81          # Made Q2/Q3 but still slower
+    efficiency: 0.80     # Technical issues persist
+
+  Honda-Customer:  # Aston Martin
+    reliability: 0.70    # TERRIBLE - Stroll DNS, Alonso P17
+    power: 0.75          # Very slow, major issues
+    efficiency: 0.73     # Struggling with integration
+
+# Team Reliability Scores (Australia GP Evidence)
+team_reliability_2026:
+  Mercedes: 0.98
+  RB: 0.95
+  McLaren: 0.94
+  Ferrari: 0.94
+  Haas: 0.93
+  Alpine: 0.89
+  Audi (Sauber): 0.82
+  Williams: 0.78        # Sainz DNS - ERS issue
+  Red Bull Racing: 0.75 # Verstappen crash - brake lock
+  Aston Martin: 0.70    # Stroll DNS, Alonso issues

@@ -1,0 +1,53 @@
+# Secrets
+.env
+.env.local
+.env.*.local
+*.env
+!.env.example
+apikeys.txt
+secrets.json
+credentials.json
+serviceAccount*.json
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Environments
+venv/
+env/
+.venv/
+node_modules/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Data & model artifacts
+/cache/
+/data/
+/predictions/
+*.parquet
+*.csv
+*.sqlite3
+*.joblib
+*.pkl
+*.h5
+*.pt
+*.ckpt
+*.onnx
+
+# Keep the checked-in Elo seed ratings
+!models/elo_ratings.json
