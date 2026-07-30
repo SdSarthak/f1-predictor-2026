@@ -1,257 +1,317 @@
 # F1 Race Predictor 2026
 
-A machine learning-based Formula 1 race prediction system built for the 2026 regulation era.
+A probabilistic Formula 1 race predictor built for the 2026 regulation reset.
 
-## Overview
-
-This predictor uses historical F1 data from multiple sources, advanced feature engineering, and Monte Carlo simulation to generate probabilistic race predictions. The system is specifically designed to handle the 2026 regulation reset with appropriate uncertainty modeling for new power units and aerodynamic changes.
-
----
-
-## Features
-
-### Data Sources
-| Source | Data Type | Purpose |
-|--------|-----------|---------|
-| **Ergast API** | Race results, qualifying, pit stops, standings | Historical performance metrics |
-| **FastF1** | Telemetry, lap times, tire data, weather | Detailed session analysis |
-
-### Predictive Factors
-| Factor | Description |
-|--------|-------------|
-| Grid Position | Historical qualifying-to-finish delta analysis |
-| Tire Degradation | Lap time slope calculation per stint |
-| Pit Stop Efficiency | Team average pit stop performance |
-| Track Dynamics | Circuit categorization (high-speed, street, high-downforce) |
-| Weather Impact | Track temperature and rain performance by driver |
-| Reliability Score | DNF rates per engine manufacturer |
-| Driver Form | Rolling 5-race performance average |
-| Active Aero Efficiency | DRS-based estimation for 2026 movable wings |
-| Power Unit Profile | 50/50 Electric/ICE performance modeling |
-
-### 2026 Regulation Adjustments
-- **Historical Weight Decay**: Reduced importance of 2023-2025 team dominance
-- **New Engine Uncertainty**: Higher variance for Audi and Red Bull Powertrains-Ford
-- **Active Aero Baseline**: Team ratings based on historical DRS effectiveness
-- **Weight Reduction Effects**: 2022 adaptation scores as proxy for -30kg impact
+It pulls historical results from the Ergast-compatible Jolpica API (optionally
+enriched with FastF1 telemetry), engineers ~35 features, trains a gradient
+boosted model on finishing position, blends the output with an Elo form rating
+that updates race by race, applies 2026 regulation adjustments, and finally runs
+a Monte Carlo race simulation to turn a single point estimate into win, podium
+and DNF probabilities with confidence intervals.
 
 ---
 
-## Project Structure
+## How it works
 
 ```
-F1 Predictor/
-├── config/
-│   └── settings.yaml           # All configuration parameters
-├── src/
-│   ├── __init__.py
-│   ├── predictor.py            # Main prediction interface
-│   ├── data/
-│   │   ├── ergast_api.py       # Ergast API client
-│   │   ├── fastf1_client.py    # FastF1 telemetry client
-│   │   └── pipeline.py         # Unified data pipeline
-│   ├── features/
-│   │   └── feature_engineering.py  # 30+ engineered features
-│   ├── models/
-│   │   └── trainer.py          # XGBoost/Random Forest training
-│   ├── simulation/
-│   │   └── monte_carlo.py      # Probabilistic race simulation
-│   └── regulations/
-│       └── rules_2026.py       # 2026-specific adjustments
-├── run_predictor.py            # Command-line interface
-├── requirements.txt            # Python dependencies
-└── README.md
+Jolpica/Ergast  ─┐
+                 ├─► data pipeline ─► feature engineering ─► XGBoost / RF / ensemble
+FastF1 (opt.)   ─┘                                                   │
+                                                                     ▼
+                          Elo form ratings ────────────► blended position estimate
+                                                                     │
+                                            2026 regulation adjustments (PU, aero, testing)
+                                                                     │
+                                                                     ▼
+                                       Monte Carlo race simulation (safety cars, DNFs)
+                                                                     │
+                                                                     ▼
+                                    win % / podium % / expected position / 90% CI
 ```
+
+### 1. Data
+
+| Source | Data | Notes |
+|---|---|---|
+| **Jolpica-F1** (Ergast mirror) | Results, qualifying, pit stops, standings, status | Paged 100 rows at a time; responses cached to `cache/` |
+| **FastF1** | Lap times, tyre stints, weather, DRS telemetry | Optional — off by default because a cold cache takes tens of minutes per season |
+
+Ergast shut down after 2024, so the client targets `https://api.jolpi.ca/ergast/f1`.
+Override with the `F1_ERGAST_BASE_URL` environment variable or `data.ergast_base_url`
+in the config.
+
+### 2. Features
+
+Rolling driver form and consistency, constructor form, grid-position features,
+per-circuit history and overtaking difficulty, pit-stop efficiency, reliability,
+rain skill, tyre degradation, Active Aero efficiency, engine/power-track
+interactions and teammate head-to-head. Rolling and expanding features are
+shifted by one race so a result never leaks into its own feature row.
+
+### 3. Elo form layer
+
+A modified Elo system rates drivers and constructors separately (30% driver /
+70% car, matching how much of the variance the car explains). It updates after
+every race via pairwise comparisons, with a larger K-factor for constructors so
+car performance can move quickly. Ratings live in `models/elo_ratings.json`.
+Its weight in the blend rises through the season (30% → 60%) as it accumulates
+evidence.
+
+### 4. 2026 regulation adjustments
+
+- **Historical weight decay** — 2022-2025 team order matters less after a reset
+- **New-engine uncertainty** — Audi and Red Bull Powertrains-Ford carry extra
+  variance that decays over the first five races
+- **Power unit profile** — 50/50 electric/ICE split, weighted by circuit type
+- **Active Aero** — per-team ratings seeded from historical DRS effectiveness
+- **Pre-season and opening-round evidence** — testing pace and reliability
+
+### 5. Monte Carlo simulation
+
+Each simulation samples a finishing position per driver from the predicted
+position and its uncertainty, then plays out first-lap incidents, safety cars
+(scaled by circuit type), red flags and per-lap reliability failures.
 
 ---
 
 ## Installation
 
 ```bash
-# Navigate to project directory
-cd "F1 Predictor"
+git clone https://github.com/SdSarthak/f1-predictor-2026.git
+cd f1-predictor-2026
 
-# Create virtual environment
 python -m venv venv
+venv\Scripts\activate          # Windows
+source venv/bin/activate       # Linux / macOS
 
-# Activate (Windows)
-venv\Scripts\activate
-
-# Activate (Linux/Mac)
-source venv/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
 ```
+
+No API keys are required. `.env.example` documents the one optional override.
 
 ---
 
 ## Usage
 
-### Command Line Interface
+### Train
 
 ```bash
-# Train model with 2022-2025 data
+# Full pipeline: fetch, engineer, train, save to models/f1_predictor.joblib
 python run_predictor.py --train
 
-# Train with specific years
-python run_predictor.py --train --years 2023 2024 2025
+# Specific seasons and model type
+python run_predictor.py --train --years 2023 2024 2025 --model ensemble
 
-# Train with different model type
-python run_predictor.py --train --model ensemble
+# Include FastF1 telemetry features (much slower - hours on a cold cache)
+python run_predictor.py --train --telemetry
+```
 
-# Predict a race
+A cold `--train` over three seasons takes roughly 5-10 minutes: the Jolpica
+mirror rate-limits, so the client sleeps between requests. Responses are cached
+under `cache/`, so re-runs are fast.
+
+### Predict
+
+```bash
+# Predict with an estimated grid
 python run_predictor.py --predict --circuit Bahrain
 
-# Predict specific round
-python run_predictor.py --predict --year 2026 --round 5 --circuit Monaco
+# Predict a specific round with known qualifying results
+python run_predictor.py --predict --year 2026 --round 5 --circuit Monaco \
+    --grid russell=1 norris=2 leclerc=3
 
-# View 2026 regulation analysis
-python run_predictor.py --regulations
-
-# Fetch data only (without training)
-python run_predictor.py --fetch --years 2024 2025
+# Raw model output, without the Elo form blend
+python run_predictor.py --predict --circuit Monza --no-elo
 ```
 
-### Python API
+Predictions are printed and written to `predictions/<year>_R<round>_<circuit>.json`.
 
-```python
-from src.predictor import F1Predictor
+### Keep ratings current
 
-# Initialize
-predictor = F1Predictor()
+```bash
+# Fold a finished race into the Elo ratings
+python run_predictor.py --update-race examples/australia_2026_results.csv \
+    --circuit "Albert Park" --round 1
 
-# Build training data
-df = predictor.build_training_data(years=[2022, 2023, 2024, 2025])
-
-# Train model
-metrics = predictor.train(df, model_type='xgboost')
-
-# Make predictions
-results = predictor.predict_race(
-    year=2026,
-    round_num=1,
-    circuit_name='Bahrain',
-    n_simulations=10000
-)
-
-# Display results
-print(predictor.format_predictions(results))
-
-# Save predictions
-predictor.save_predictions(results)
+# Inspect current ratings
+python run_predictor.py --ratings
 ```
 
-### Individual Components
+The results CSV needs `driver_id`, `constructor_id` and `position`, plus optional
+`quali_position` and `dnf` — see `examples/australia_2026_results.csv`.
 
-```python
-# Data fetching
-from src.data.ergast_api import ErgastAPI
-from src.data.fastf1_client import FastF1Client
+### Other commands
 
-ergast = ErgastAPI()
-results = ergast.get_race_results(2024)
-reliability = ergast.calculate_reliability_scores([2023, 2024])
-
-fastf1 = FastF1Client()
-laps = fastf1.get_lap_data(2024, 'Bahrain', 'R')
-degradation = fastf1.calculate_tire_degradation(laps)
-
-# Feature engineering
-from src.features.feature_engineering import engineer_features
-df_engineered, engineer = engineer_features(df)
-
-# Model training
-from src.models.trainer import train_model
-trainer, metrics = train_model(df, feature_columns, model_type='xgboost')
-
-# Monte Carlo simulation
-from src.simulation.monte_carlo import MonteCarloSimulator
-simulator = MonteCarloSimulator()
-mc_results = simulator.run_monte_carlo(
-    predicted_positions, uncertainties, grid, reliability
-)
-
-# 2026 regulations
-from src.regulations.rules_2026 import Regulations2026
-regs = Regulations2026()
-uncertainty = regs.calculate_2026_team_uncertainty('red_bull', race_number=1)
+```bash
+python run_predictor.py --regulations           # 2026 regulation analysis
+python run_predictor.py --fetch --years 2024 2025   # Fetch and cache data only
 ```
 
 ---
 
-## Output Format
+## Python API
+
+```python
+from src.predictor import F1Predictor
+
+predictor = F1Predictor()
+
+df = predictor.build_training_data(years=[2023, 2024, 2025])
+metrics = predictor.train(df, model_type='xgboost')
+
+results = predictor.predict_race(
+    year=2026,
+    round_num=1,
+    circuit_name='Bahrain',
+    grid_positions={'russell': 1, 'norris': 2},
+    n_simulations=10000,
+)
+
+print(predictor.format_predictions(results))
+predictor.save_predictions(results)
+```
+
+Individual components can be used on their own:
+
+```python
+from src.data.ergast_api import ErgastAPI
+from src.features.feature_engineering import engineer_features
+from src.models.race_updater import RaceByRaceUpdater
+from src.simulation.monte_carlo import MonteCarloSimulator
+from src.regulations.rules_2026 import Regulations2026
+
+results = ErgastAPI().get_race_results(2024)
+df, engineer = engineer_features(results, config={})
+
+updater = RaceByRaceUpdater(elo_weight=0.4)
+blended, uncertainty = updater.blend_predictions(ml_preds, ml_unc, driver_to_team)
+
+mc = MonteCarloSimulator().run_monte_carlo(preds, unc, grid, reliability)
+
+regs = Regulations2026()
+regs.calculate_2026_team_uncertainty('sauber', race_number=1)
+```
+
+---
+
+## Example output
 
 ```
-======================================================================
+==============================================================================
 F1 2026 Race Prediction: Bahrain
-Round 1 | Circuit Type: power_hungry
-======================================================================
+Round 1 | Circuit Type: power_hungry | Elo weight: 40%
+==============================================================================
 
-Pos  Driver               Win %    Podium %    Exp Pos    ±Std
-----------------------------------------------------------------------
-  1  verstappen            34.2%      78.5%        2.1      1.8
-  2  norris                22.1%      65.3%        2.8      2.1
-  3  leclerc               18.7%      58.2%        3.2      2.3
-  4  piastri               12.4%      42.1%        4.1      2.5
-  5  sainz                  7.8%      35.6%        4.8      2.4
-...
+Pos  Driver                            Grid     Win %   Podium %   Exp Pos  +/-Std
+------------------------------------------------------------------------------
+1    Kimi Antonelli (Mercedes)            2     30.5%      75.5%       2.9     3.1
+2    George Russell (Mercedes)            1     42.2%      72.0%       3.0     3.1
+3    Lewis Hamilton (Ferrari)             4      7.2%      43.8%       4.4     3.8
+4    Lando Norris (McLaren)               5     10.5%      42.5%       4.8     4.0
+5    Oscar Piastri (McLaren)              6      5.0%      35.0%       4.8     3.4
 
-90% Confidence Intervals:
-----------------------------------------
-  verstappen: P1 - P5
-  norris: P1 - P6
-  leclerc: P1 - P7
+90% Confidence Intervals (top 10):
+--------------------------------------------------
+  Kimi Antonelli (Mercedes)                P1 - P6
+  George Russell (Mercedes)                P1 - P7
+  Lewis Hamilton (Ferrari)                 P1 - P11
 ```
 
 ---
 
 ## Configuration
 
-Edit `config/settings.yaml` to customize:
+Everything tunable lives in `config/settings.yaml`.
 
-| Section | Parameters |
-|---------|------------|
-| `data` | Training years, cache directory, API settings |
-| `regulations_2026` | Weight decay, new engine uncertainty, Active Aero ratings |
-| `track_categories` | High-speed, street circuit, power-hungry classifications |
-| `model` | XGBoost/Random Forest hyperparameters, CV folds |
-| `monte_carlo` | Simulation count, safety car probability, DNF rates |
-| `rain_performance` | Driver wet weather skill ratings |
-
----
-
-## Model Performance Targets
-
-| Metric | Target | Description |
-|--------|--------|-------------|
-| MAE | < 2.5 | Mean Absolute Error in positions |
-| Within ±2 | > 65% | Predictions within 2 positions of actual |
-| CV MAE | < 3.0 | Cross-validated Mean Absolute Error |
+| Section | Controls |
+|---|---|
+| `data` | Training years, cache directory, API base URL, FastF1 toggle |
+| `regulations_2026` | Weight decay, new-engine uncertainty |
+| `track_categories` | High-speed / street / high-downforce / power-hungry circuits |
+| `elo` | Enabled, blend weight, K-factors, ratings path |
+| `model` | XGBoost and Random Forest hyperparameters, CV folds |
+| `monte_carlo` | Simulation count, safety car / red flag / first-lap probabilities |
+| `active_aero_ratings` | Per-team Active Aero baselines |
+| `team_reliability_2026` | Per-team reliability used by the simulation |
+| `rain_performance` | Per-driver wet-weather skill |
 
 ---
 
-## Data Sources
+## Model performance
 
-- **Ergast Developer API**: http://ergast.com/mrd/
-- **FastF1 Python Library**: https://docs.fastf1.dev/
+Measured on 2023-2025 (1,398 driver-races), XGBoost with default config:
+
+| Metric | Value |
+|---|---|
+| MAE | 3.05 positions |
+| RMSE | 4.13 |
+| R² | 0.48 |
+| Within ±1 position | 25.7% |
+| Within ±2 positions | 45.7% |
+| Within ±3 positions | 58.9% |
+| CV MAE (5-fold) | 3.28 ± 0.08 |
+
+These are honest numbers from a leak-free feature set. Finishing position is
+substantially irreducible — retirements, strategy and first-lap incidents are
+not predictable from pre-race information — which is exactly why the output is
+reported as a probability distribution rather than a single predicted order.
+
+---
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+155 tests covering feature engineering (including leak-freedom), model training
+and persistence, Monte Carlo statistical properties, the Elo system, 2026
+regulation adjustments, Ergast pagination and the end-to-end prediction path.
+No test touches the network.
+
+---
+
+## Project structure
+
+```
+f1-predictor-2026/
+├── config/settings.yaml           # All tunable parameters
+├── examples/                      # Sample race-result CSV
+├── models/elo_ratings.json        # Persisted Elo ratings
+├── src/
+│   ├── constants.py               # Shared naming / circuit tables
+│   ├── predictor.py               # Main prediction interface
+│   ├── data/
+│   │   ├── ergast_api.py          # Paged Jolpica/Ergast client
+│   │   ├── fastf1_client.py       # FastF1 telemetry client
+│   │   ├── pipeline.py            # Unified data pipeline
+│   │   └── testing_data_2026.py   # 2026 pre-season and opening-round data
+│   ├── features/feature_engineering.py
+│   ├── models/
+│   │   ├── trainer.py             # XGBoost / Random Forest / ensemble
+│   │   ├── elo_updater.py         # Modified Elo rating system
+│   │   └── race_updater.py        # ML + Elo blending
+│   ├── simulation/monte_carlo.py
+│   └── regulations/rules_2026.py
+├── tests/
+├── run_predictor.py               # CLI
+└── requirements.txt
+```
+
+Generated artefacts (`cache/`, `data/`, `predictions/`, `*.joblib`) are gitignored.
 
 ---
 
 ## Requirements
 
-- Python 3.9+
-- See `requirements.txt` for full dependency list
+Python 3.9+. See `requirements.txt`.
 
-Key dependencies:
-- `fastf1` - F1 telemetry data
-- `xgboost` - Gradient boosting model
-- `scikit-learn` - Machine learning utilities
-- `pandas`, `numpy` - Data processing
-- `requests` - API calls
+## Data sources
 
----
+- Jolpica-F1 (Ergast mirror): https://api.jolpi.ca/ergast/f1
+- FastF1: https://docs.fastf1.dev/
 
 ## License
 
-MIT License
+MIT
