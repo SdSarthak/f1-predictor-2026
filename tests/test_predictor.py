@@ -34,7 +34,9 @@ def test_prediction_features_are_actually_built(predictor):
     features = predictor._build_prediction_features(2026, 1, 'Bahrain', None, None)
 
     assert not features.empty
-    assert len(features) == predictor.training_data['driver_id'].nunique()
+    # A 2026 race is run by the confirmed 2026 entry list, not by whoever
+    # happens to appear in the training history.
+    assert len(features) == len(predictor.regulations.get_2026_grid_entries())
     assert features['driver_id'].is_unique
 
 
@@ -47,7 +49,7 @@ def test_prediction_features_cover_every_model_input(predictor):
 
 
 def test_supplied_grid_positions_are_respected(predictor):
-    drivers = list(predictor.training_data['driver_id'].unique())
+    drivers = [entry['driver_id'] for entry in predictor.regulations.get_2026_grid_entries()]
     grid = {driver: i + 1 for i, driver in enumerate(drivers)}
 
     features = predictor._build_prediction_features(2026, 1, 'Bahrain', None, grid)
@@ -254,3 +256,97 @@ def test_update_after_race_requires_the_core_columns(predictor):
     with pytest.raises(ValueError, match="missing required columns"):
         predictor.update_after_race(pd.DataFrame({'driver_id': ['russell']}),
                                     circuit='Bahrain', round_num=1)
+
+
+def test_load_model_restores_the_history_the_model_needs(engineered, config_path, tmp_path):
+    """
+    Regression: `load_model` used to restore only the estimator. Without the
+    training history the feature engineer has no fitted encoders and no
+    per-driver rows, so every driver was scored on identical defaults with
+    `*_encoded == -1` - the model collapsed into "predict the grid order".
+    """
+    df, engineer = engineered
+
+    trained = F1Predictor(config_path, use_elo=False)
+    trained.feature_engineer = engineer
+    trained.training_data = df
+    trained.train(df, model_type='xgboost', save=False)
+
+    model_path = tmp_path / "model.joblib"
+    history_path = tmp_path / "history.parquet"
+    trained.model_trainer.save_model(str(model_path))
+    df.to_parquet(history_path, index=False)
+
+    reloaded = F1Predictor(config_path, use_elo=False)
+    reloaded.history_path = str(history_path)
+    reloaded.load_model(str(model_path))
+
+    assert reloaded.training_data is not None
+    assert reloaded.feature_engineer.label_encoders
+
+    features = reloaded._build_prediction_features(2026, 1, 'Bahrain', None, None)
+    known = features[features['driver_id'].isin(df['driver_id'])]
+
+    assert not known.empty
+    assert (known['driver_id_encoded'] >= 0).all()
+    assert known['driver_form'].nunique() > 1
+
+
+def test_prediction_without_history_still_produces_a_result(config_path, tmp_path, caplog):
+    """Missing history must degrade to defaults with a warning, not crash."""
+    predictor = F1Predictor(config_path, use_elo=False)
+    predictor.history_path = str(tmp_path / "does_not_exist.parquet")
+
+    assert predictor.load_history() is False
+    assert predictor.training_data is None
+
+
+def test_train_from_missing_history_raises_a_useful_error(config_path, tmp_path):
+    predictor = F1Predictor(config_path, use_elo=False)
+    predictor.history_path = str(tmp_path / "nope.parquet")
+
+    with pytest.raises(FileNotFoundError, match="Could not load training history"):
+        predictor.train()
+
+
+def test_car_features_follow_the_2026_team_not_the_old_one(predictor):
+    """
+    A driver who changed team must not carry his previous constructor's car
+    performance into the new season.
+    """
+    df = predictor.training_data
+    moved = df['driver_id'].iloc[0]
+
+    features = predictor._build_prediction_features(2026, 1, 'Bahrain', None, None)
+    features = features.set_index('driver_id')
+
+    for _, row in features.iterrows():
+        team_rows = df[df['constructor_id'] == row['constructor_id']]
+        if team_rows.empty:
+            continue
+        assert row['constructor_form'] == pytest.approx(
+            float(team_rows.iloc[-1]['constructor_form'])
+        )
+    assert moved  # sanity: the fixture is not empty
+
+
+def test_a_2026_field_never_exceeds_the_number_of_seats(engineered, config_path):
+    """
+    A season's history lists everyone who appeared, including mid-season
+    replacements, so deriving the field from it can over-fill the grid.
+    """
+    df, engineer = engineered
+
+    # Add a replacement driver who only appeared in the first round.
+    replaced = df[df['round'] == df['round'].min()].head(1).copy()
+    replaced['driver_id'] = 'stand_in'
+    replaced['driver_code'] = 'STA'
+    history = pd.concat([df, replaced], ignore_index=True)
+
+    predictor = F1Predictor(config_path, use_elo=False)
+    predictor.feature_engineer = engineer
+    predictor.training_data = history
+
+    entries = predictor._resolve_grid_entries(2025, None)
+
+    assert 'stand_in' not in {e['driver_id'] for e in entries}

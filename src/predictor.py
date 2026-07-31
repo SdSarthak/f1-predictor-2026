@@ -56,6 +56,7 @@ class F1Predictor:
 
         self.is_trained = False
         self.training_data: Optional[pd.DataFrame] = None
+        self.history_path = "data/training_data.parquet"
 
     def _load_config(self, config_path: str) -> Dict:
         """Load configuration from YAML, falling back to built-in defaults."""
@@ -111,7 +112,43 @@ class F1Predictor:
         
         return df
     
-    def train(self, 
+    def load_history(self, path: Optional[str] = None, required: bool = False) -> bool:
+        """
+        Load the saved training dataset and refit the feature engineer on it.
+
+        Prediction depends on this for two things that are otherwise silently
+        missing: each driver's most recent engineered feature row, and the
+        fitted label encoders for the categorical columns. Without it every
+        driver is scored on neutral defaults with `*_encoded == -1`, i.e. the
+        model degenerates into "predict the grid order".
+
+        Returns True if history is available afterwards.
+        """
+        if self.training_data is not None and not self.training_data.empty:
+            return True
+
+        path = path or self.history_path
+        try:
+            df = self.pipeline.load_dataset(path)
+        except (OSError, ValueError) as exc:
+            message = (f"Could not load training history from {path}: {exc}. "
+                       "Predictions will fall back to neutral feature values - "
+                       "run `--train` (or `--fetch`) to rebuild it.")
+            if required:
+                raise FileNotFoundError(message) from exc
+            logger.warning(message)
+            return False
+
+        if df is None or df.empty:
+            logger.warning(f"Training history at {path} is empty; ignoring it")
+            return False
+
+        df, self.feature_engineer = engineer_features(df, self.config)
+        self.training_data = df
+        logger.info(f"Loaded {len(df)} historical rows from {path}")
+        return True
+
+    def train(self,
              df: pd.DataFrame = None,
              model_type: str = 'xgboost',
              save: bool = True) -> Dict[str, float]:
@@ -127,12 +164,14 @@ class F1Predictor:
             Training metrics
         """
         if df is None:
-            if self.training_data is not None:
-                df = self.training_data
-            else:
-                df = self.pipeline.load_dataset()
-                df, self.feature_engineer = engineer_features(df, self.config)
-        
+            self.load_history(required=True)
+            df = self.training_data
+        else:
+            # Keep the engineer that produced `df` in sync with what is scored
+            # later; `build_training_data` already set it.
+            self.training_data = df
+
+
         # Get feature columns
         feature_columns = self.feature_engineer.get_feature_columns()
         target_column = self.feature_engineer.get_target_column()
@@ -150,10 +189,27 @@ class F1Predictor:
         
         return metrics
     
-    def load_model(self, path: str = "models/f1_predictor.joblib"):
-        """Load a pre-trained model."""
+    def load_model(self,
+                   path: str = "models/f1_predictor.joblib",
+                   with_history: bool = True):
+        """
+        Load a pre-trained model.
+
+        Also reloads the training history by default. The model alone is not
+        enough to score a race: the per-driver feature rows and the fitted
+        categorical encoders live in the dataset, and without them every driver
+        is scored on identical neutral defaults.
+        """
         self.model_trainer.load_model(path)
         self.is_trained = True
+
+        if with_history and not self.load_history():
+            logger.warning(
+                "Predicting without training history: driver form, constructor "
+                "form, track record and the encoded categoricals will all sit at "
+                "neutral defaults, so the result is little more than grid order."
+            )
+
         logger.info("Model loaded successfully")
     
     def predict_race(self,
@@ -163,7 +219,8 @@ class F1Predictor:
                     drivers: List[str] = None,
                     grid_positions: Dict[str, int] = None,
                     run_simulation: bool = True,
-                    n_simulations: int = 10000) -> Dict[str, Any]:
+                    n_simulations: int = 10000,
+                    seed: Optional[int] = None) -> Dict[str, Any]:
         """
         Predict a race result.
         
@@ -175,6 +232,7 @@ class F1Predictor:
             grid_positions: Qualifying positions (if None, uses prediction)
             run_simulation: Whether to run Monte Carlo simulation
             n_simulations: Number of MC simulations
+            seed: Seed for the Monte Carlo stage, making the run reproducible
             
         Returns:
             Complete prediction results
@@ -267,7 +325,8 @@ class F1Predictor:
                 reliability,
                 race_laps=self._get_race_laps(circuit_name),
                 circuit_type=circuit_type,
-                n_simulations=n_simulations
+                n_simulations=n_simulations,
+                seed=seed,
             )
             
             result['monte_carlo'] = {
@@ -287,6 +346,19 @@ class F1Predictor:
         
         return result
     
+    # Features that describe the car, not the driver. When a driver changes team
+    # these must come from the new constructor's history, otherwise a driver who
+    # moved (Tsunoda: Red Bull -> RB) carries his old team's car performance.
+    CONSTRUCTOR_SCOPED_FEATURES = (
+        'constructor_form',
+        'reliability_score',
+        'pit_efficiency',
+        'pit_consistency',
+        'active_aero_efficiency',
+        'season_avg_deg',
+        'is_new_engine',
+    )
+
     def _default_feature_value(self, column: str) -> float:
         """Neutral fallback for a feature column (shared with the engineer)."""
         return FeatureEngineer.default_for(column)
@@ -299,14 +371,31 @@ class F1Predictor:
 
         Preference order:
           1. the explicit ``drivers`` argument,
-          2. the most recent season present in the loaded training data,
-          3. the confirmed 2026 entry list.
+          2. the confirmed 2026 entry list for 2026+ races,
+          3. the most recent season present in the loaded training data.
+
+        The 2026 list wins over history for 2026 races because a season's
+        history contains every driver who *appeared*, including mid-season
+        replacements - 2025 alone yields 22 entries for 20 seats.
         """
         entries: List[Dict[str, str]] = []
 
-        if self.training_data is not None and not self.training_data.empty:
+        if year >= 2026:
+            entries = self.regulations.get_2026_grid_entries()
+
+        if not entries and self.training_data is not None and not self.training_data.empty:
             history = self.training_data
             latest_season = history[history['year'] == history['year'].max()]
+
+            # Only the cars that took the start of the final round: a season's
+            # full driver list includes anyone who was replaced mid-year, which
+            # would put more cars on the grid than there are seats.
+            final_round = latest_season[latest_season['round'] == latest_season['round'].max()]
+            if not final_round.empty:
+                latest_season = latest_season[
+                    latest_season['driver_id'].isin(final_round['driver_id'])
+                ]
+
             latest = latest_season.groupby('driver_id').last().reset_index()
 
             for _, row in latest.iterrows():
@@ -482,8 +571,19 @@ class F1Predictor:
             # Carry forward the driver's latest engineered features.
             if history is not None and not history.empty:
                 driver_history = history[history['driver_id'] == driver_id]
+
+                # Ergast ids and the 2026 entry list disagree for a handful of
+                # drivers (`max_verstappen` vs `verstappen`); the three-letter
+                # code is stable across both, so fall back to it.
+                if driver_history.empty and 'driver_code' in history.columns:
+                    code = entry.get('driver_code')
+                    if code:
+                        driver_history = history[history['driver_code'] == code]
+
                 if not driver_history.empty:
                     latest = driver_history.iloc[-1]
+                    # Encode against the id the label encoder was fitted on.
+                    row['_history_driver_id'] = latest['driver_id']
                     for column in feature_columns:
                         if column in latest.index and pd.notna(latest[column]):
                             row[column] = latest[column]
@@ -495,6 +595,16 @@ class F1Predictor:
                         value = track_rows.iloc[-1]['track_historical_perf']
                         if pd.notna(value):
                             row['track_historical_perf'] = value
+
+            # Car-level features come from the 2026 constructor, not from
+            # whichever team the driver last raced for.
+            if history is not None and not history.empty:
+                team_history = history[history['constructor_id'] == entry['constructor_id']]
+                if not team_history.empty:
+                    team_latest = team_history.iloc[-1]
+                    for column in self.CONSTRUCTOR_SCOPED_FEATURES:
+                        if column in team_latest.index and pd.notna(team_latest[column]):
+                            row[column] = team_latest[column]
 
             # Race-specific values always win over carried-forward history.
             row.update(circuit_flags)
@@ -510,7 +620,15 @@ class F1Predictor:
             rows.append(row)
 
         df = pd.DataFrame(rows)
+
+        # Encode with the historical driver id where the two vocabularies differ,
+        # then restore the entry-list id for reporting.
+        display_ids = df['driver_id'].copy()
+        if '_history_driver_id' in df.columns:
+            df['driver_id'] = df['_history_driver_id'].fillna(df['driver_id'])
         df = self.feature_engineer.transform_categoricals(df)
+        df['driver_id'] = display_ids
+        df = df.drop(columns=['_history_driver_id'], errors='ignore')
 
         # Guarantee every model input exists and is finite.
         for column in feature_columns:
