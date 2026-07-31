@@ -34,6 +34,10 @@ def train_model(years: List[int] = None,
     if years is None:
         years = [2022, 2023, 2024, 2025]
 
+    invalid = [year for year in years if not 1950 <= year <= 2100]
+    if invalid:
+        raise ValueError(f"--years contains implausible seasons: {invalid}")
+
     print("=" * 70)
     print("F1 Race Predictor 2026 - Model Training")
     print("=" * 70)
@@ -73,24 +77,51 @@ def train_model(years: List[int] = None,
     return metrics
 
 
+MAX_GRID_SLOTS = 30
+
+
 def parse_grid(entries: Optional[List[str]]) -> Optional[Dict[str, int]]:
     """
     Parse `--grid driver=position` arguments into a grid mapping.
 
     Example: `--grid verstappen=1 norris=2`
+
+    Positions must be distinct and inside the grid, otherwise the slot filler
+    silently produces a field with two cars on the same square or a driver
+    starting from P0.
     """
     if not entries:
         return None
 
     grid: Dict[str, int] = {}
+    taken: Dict[int, str] = {}
+
     for entry in entries:
         if '=' not in entry:
             raise ValueError(f"Invalid --grid entry '{entry}'. Use driver_id=position.")
         driver, _, position = entry.partition('=')
+        driver = driver.strip()
+
+        if not driver:
+            raise ValueError(f"Invalid --grid entry '{entry}': no driver id.")
         try:
-            grid[driver.strip()] = int(position)
+            slot = int(position)
         except ValueError:
-            raise ValueError(f"Grid position for '{driver}' must be an integer, got '{position}'.")
+            raise ValueError(
+                f"Grid position for '{driver}' must be an integer, got '{position}'.")
+
+        if not 1 <= slot <= MAX_GRID_SLOTS:
+            raise ValueError(
+                f"Grid position for '{driver}' must be between 1 and "
+                f"{MAX_GRID_SLOTS}, got {slot}.")
+        if slot in taken:
+            raise ValueError(
+                f"Grid position {slot} is claimed by both '{taken[slot]}' and '{driver}'.")
+        if driver in grid:
+            raise ValueError(f"Driver '{driver}' appears twice in --grid.")
+
+        grid[driver] = slot
+        taken[slot] = driver
 
     return grid
 
@@ -100,7 +131,8 @@ def predict_race(year: int = 2026,
                 circuit: str = None,
                 grid: Dict[str, int] = None,
                 simulations: int = 10000,
-                use_elo: bool = True) -> Dict:
+                use_elo: bool = True,
+                seed: Optional[int] = None) -> Dict:
     """
     Predict a race result with Monte Carlo simulation.
 
@@ -111,10 +143,18 @@ def predict_race(year: int = 2026,
         grid: Dict of driver_id -> grid position
         simulations: Number of Monte Carlo simulations
         use_elo: Blend the ML output with race-by-race Elo form
+        seed: Seed the Monte Carlo stage so the run can be reproduced
 
     Returns:
         Prediction results dictionary
     """
+    if simulations < 1:
+        raise ValueError(f"--simulations must be at least 1, got {simulations}")
+    if round_num < 1:
+        raise ValueError(f"--round must be at least 1, got {round_num}")
+    if not 1950 <= year <= 2100:
+        raise ValueError(f"--year {year} is outside the plausible range 1950-2100")
+
     print("=" * 70)
     print("F1 Race Predictor 2026 - Race Prediction")
     print("=" * 70)
@@ -139,7 +179,8 @@ def predict_race(year: int = 2026,
         circuit_name=circuit,
         grid_positions=grid,
         run_simulation=True,
-        n_simulations=simulations
+        n_simulations=simulations,
+        seed=seed,
     )
 
     # Display results
@@ -183,7 +224,17 @@ def update_from_results(path: str, circuit: str, round_num: int) -> None:
     """
     import pandas as pd
 
-    results = pd.read_csv(path)
+    source = Path(path)
+    if not source.is_file():
+        raise FileNotFoundError(f"Race results CSV not found: {path}")
+
+    try:
+        results = pd.read_csv(source)
+    except (pd.errors.ParserError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Could not parse {path} as CSV: {exc}") from exc
+
+    if results.empty:
+        raise ValueError(f"{path} contains no rows")
 
     print("=" * 70)
     print(f"Updating Elo ratings from {path}")
@@ -340,6 +391,8 @@ Examples:
                        help='Monte Carlo simulations (default: 10000)')
     parser.add_argument('--no-elo', action='store_true',
                        help='Use the raw ML prediction without the Elo form blend')
+    parser.add_argument('--seed', type=int, default=None,
+                       help='Seed the Monte Carlo stage so a run is reproducible')
 
     args = parser.parse_args()
     use_fastf1 = True if args.telemetry else None
@@ -355,6 +408,7 @@ Examples:
             grid=parse_grid(args.grid),
             simulations=args.simulations,
             use_elo=not args.no_elo,
+            seed=args.seed,
         )
     elif args.regulations:
         show_2026_regulations()
