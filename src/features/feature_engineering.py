@@ -24,12 +24,32 @@ class FeatureEngineer:
         self.label_encoders: Dict[str, LabelEncoder] = {}
         self.scaler = StandardScaler()
         
+    # Columns this class derives by merging an aggregate back onto `df`. If they
+    # are already present - which they are whenever an engineered dataset is
+    # round-tripped through `save_dataset` / `load_dataset` - pandas suffixes the
+    # merge output to `<name>_x` / `<name>_y` and the real column disappears.
+    DERIVED_MERGE_COLUMNS = ('constructor_form', 'overtake_difficulty', 'teammate_battle_rate')
+
     def engineer_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Main feature engineering pipeline.
+
+        Idempotent: running it again over an already-engineered frame reproduces
+        the same columns instead of colliding with the previous run's output.
         """
+        if df is None or df.empty:
+            raise ValueError("Cannot engineer features from an empty dataset")
+
+        required = {'driver_id', 'constructor_id', 'circuit_id', 'finish_position'}
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(
+                f"Dataset is missing required columns for feature engineering: {sorted(missing)}"
+            )
+
         df = df.copy()
-        
+        df = df.drop(columns=[c for c in self.DERIVED_MERGE_COLUMNS if c in df.columns])
+
         # Driver form (rolling average of last N races)
         df = self._calculate_driver_form(df, window=5)
         
@@ -282,13 +302,20 @@ class FeatureEngineer:
         else:
             df['pit_efficiency'] = 1.0
         
-        # Team pit consistency (lower std = more consistent)
-        if 'team_avg_pit_time' in df.columns:
+        # Team pit consistency (lower std = more consistent).
+        # Guarded on the column actually used - `team_avg_pit_time` can exist
+        # without `avg_pit_time`, which used to raise KeyError here.
+        if 'avg_pit_time' in df.columns:
             team_pit_std = df.groupby('constructor_id')['avg_pit_time'].transform('std')
-            df['pit_consistency'] = 1 - (team_pit_std / team_pit_std.max()).fillna(0)
+            worst = team_pit_std.max()
+            if pd.notna(worst) and worst > 0:
+                df['pit_consistency'] = 1 - (team_pit_std / worst).fillna(0)
+            else:
+                # Every team equally consistent (or no usable data at all).
+                df['pit_consistency'] = 1.0 if pd.notna(worst) else 0.8
         else:
             df['pit_consistency'] = 0.8
-        
+
         return df
     
     def _engineer_power_unit_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -318,10 +345,14 @@ class FeatureEngineer:
         
         df['is_new_engine'] = df['engine_manufacturer'].isin(new_engine_names).astype(int)
         
-        # Power track indicator (from config)
-        power_tracks = self.config.get('track_categories', {}).get('power_hungry', [])
-        df['is_power_track'] = df['circuit_name'].apply(
-            lambda x: 1 if any(t.lower() in x.lower() for t in power_tracks) else 0
+        # Power track indicator (from config). `circuit_name` is missing for
+        # some historical rounds, so coerce to string before matching.
+        power_tracks = [t.lower() for t in
+                        self.config.get('track_categories', {}).get('power_hungry', [])]
+        names = df['circuit_name'].fillna('').astype(str).str.lower() \
+            if 'circuit_name' in df.columns else pd.Series('', index=df.index)
+        df['is_power_track'] = names.apply(
+            lambda name: int(any(track in name for track in power_tracks))
         )
         
         # Interaction: new engine on power track = higher risk

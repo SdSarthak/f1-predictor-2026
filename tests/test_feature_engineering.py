@@ -2,6 +2,7 @@
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from src.features.feature_engineering import FeatureEngineer, engineer_features
 
@@ -147,3 +148,59 @@ def _minimal_frame() -> pd.DataFrame:
     df = pd.DataFrame(rows)
     df['position_delta'] = df['grid_position'] - df['finish_position']
     return df
+
+
+def test_engineering_is_idempotent_over_an_already_engineered_frame(engineered):
+    """
+    `save_dataset` persists the engineered frame, so `train()` and prediction
+    both re-run the engineer over its own output. The merge-based features used
+    to collide into `<name>_x` / `<name>_y`, which raised
+    `KeyError: 'overtake_difficulty'` and silently reset `constructor_form`.
+    """
+    df, engineer = engineered
+
+    again, engineer2 = engineer_features(df.copy(), engineer.config)
+
+    assert not [c for c in again.columns if c.endswith(('_x', '_y'))]
+    assert len(again) == len(df)
+    for column in engineer.get_feature_columns():
+        np.testing.assert_allclose(
+            again[column].astype(float).to_numpy(),
+            df[column].astype(float).to_numpy(),
+            err_msg=f"{column} changed on the second pass",
+        )
+
+
+def test_empty_and_malformed_input_is_rejected_with_a_useful_message():
+    engineer = FeatureEngineer({})
+
+    with pytest.raises(ValueError, match="empty dataset"):
+        engineer.engineer_features(pd.DataFrame())
+
+    with pytest.raises(ValueError, match="missing required columns"):
+        engineer.engineer_features(pd.DataFrame({'driver_id': ['a'], 'round': [1]}))
+
+
+def test_pit_consistency_survives_a_single_constructor():
+    """
+    One team means a zero spread in pit times; the old code divided by that
+    maximum and produced NaN/inf for every row.
+    """
+    engineer = FeatureEngineer({})
+    df = _minimal_frame()
+    df['avg_pit_time'] = 22.5
+
+    out = engineer.engineer_features(df)
+
+    assert np.isfinite(out['pit_consistency'].to_numpy(dtype=float)).all()
+
+
+def test_missing_circuit_names_do_not_crash_the_power_track_flag():
+    """`NaN.lower()` used to raise AttributeError mid-build."""
+    engineer = FeatureEngineer({'track_categories': {'power_hungry': ['Monza']}})
+    df = _minimal_frame()
+    df.loc[0, 'circuit_name'] = np.nan
+
+    out = engineer.engineer_features(df)
+
+    assert set(out['is_power_track'].unique()) <= {0, 1}

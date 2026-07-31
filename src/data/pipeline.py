@@ -265,13 +265,18 @@ class F1DataPipeline:
     def _add_track_categories(self, df: pd.DataFrame) -> pd.DataFrame:
         """Add track category features."""
         track_cats = self.config.get('track_categories', {})
-        
+
+        # `circuit_name` is occasionally absent/NaN in the upstream feed, and
+        # `NaN.lower()` used to raise AttributeError mid-build.
+        names = df['circuit_name'].fillna('').astype(str).str.lower()
+
         # Create binary columns for each category
         for category, tracks in track_cats.items():
-            df[f'is_{category}'] = df['circuit_name'].apply(
-                lambda x: 1 if any(t.lower() in x.lower() for t in tracks) else 0
+            lowered = [t.lower() for t in tracks]
+            df[f'is_{category}'] = names.apply(
+                lambda name: int(any(track in name for track in lowered))
             )
-        
+
         return df
     
     def _apply_historical_weights(self, df: pd.DataFrame) -> pd.DataFrame:
