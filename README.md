@@ -122,6 +122,9 @@ python run_predictor.py --predict --year 2026 --round 5 --circuit Monaco \
 
 # Raw model output, without the Elo form blend
 python run_predictor.py --predict --circuit Monza --no-elo
+
+# Reproducible run - the same seed always gives the same probabilities
+python run_predictor.py --predict --circuit Bahrain --seed 42
 ```
 
 Predictions are printed and written to `predictions/<year>_R<round>_<circuit>.json`.
@@ -239,22 +242,39 @@ Everything tunable lives in `config/settings.yaml`.
 
 ## Model performance
 
-Measured on 2023-2025 (1,398 driver-races), XGBoost with default config:
+Measured on 2023-2025 (1,398 driver-races, 70 races), XGBoost with default
+config. **Whole races are held out** — a random row split leaves 19 of a race's
+20 cars in training while the 20th is scored, and finishing position is a
+permutation within the race, so a row-level split flatters the model. The
+scaler is fitted on the training rows only, inside each CV fold.
 
 | Metric | Value |
 |---|---|
-| MAE | 3.05 positions |
-| RMSE | 4.13 |
-| R² | 0.48 |
-| Within ±1 position | 25.7% |
-| Within ±2 positions | 45.7% |
-| Within ±3 positions | 58.9% |
-| CV MAE (5-fold) | 3.28 ± 0.08 |
+| MAE | 3.29 positions |
+| RMSE | 4.27 |
+| R² | 0.45 |
+| Within ±1 position | 21.1% |
+| Within ±2 positions | 37.5% |
+| Within ±3 positions | 55.0% |
+| CV MAE (5-fold, grouped by race) | 3.06 ± 0.26 |
 
-These are honest numbers from a leak-free feature set. Finishing position is
-substantially irreducible — retirements, strategy and first-lap incidents are
-not predictable from pre-race information — which is exactly why the output is
-reported as a probability distribution rather than a single predicted order.
+These are honest numbers from a leak-free feature set and a leak-free split.
+Finishing position is substantially irreducible — retirements, strategy and
+first-lap incidents are not predictable from pre-race information — which is
+exactly why the output is reported as a probability distribution rather than a
+single predicted order.
+
+### Reproducibility
+
+`--predict --seed N` fixes the Monte Carlo stage, so the same model, grid and
+seed always produce the same probabilities. Without `--seed` the simulation is
+freshly random each run.
+
+Prediction also needs `data/training_data.parquet` alongside the model: the
+per-driver feature rows and the fitted categorical encoders live in the
+dataset, not in the `.joblib`. `--train` writes both. If the dataset is missing
+the predictor warns and falls back to neutral feature values, which reduces the
+output to little more than grid order.
 
 ---
 
@@ -265,7 +285,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-155 tests covering feature engineering (including leak-freedom), model training
+Tests cover feature engineering (including leak-freedom), model training
 and persistence, Monte Carlo statistical properties, the Elo system, 2026
 regulation adjustments, Ergast pagination and the end-to-end prediction path.
 No test touches the network.
