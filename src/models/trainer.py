@@ -11,9 +11,17 @@ import logging
 import joblib
 import yaml
 
-from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
+from sklearn.model_selection import (
+    GridSearchCV,
+    GroupKFold,
+    GroupShuffleSplit,
+    KFold,
+    cross_val_score,
+    train_test_split,
+)
 from sklearn.ensemble import RandomForestRegressor, VotingRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 import xgboost as xgb
 
@@ -34,7 +42,17 @@ class F1ModelTrainer:
         self.target_column: str = 'finish_position'
         self.model_type: str = 'xgboost'
         self.feature_importance: Dict[str, float] = {}
-        
+        # Race key per prepared row, used to keep a race's cars on one side of
+        # the train/test split. Set by `prepare_data`.
+        self.groups: Optional[np.ndarray] = None
+        # Fixed generator for the input-perturbation uncertainty estimate.
+        self.uncertainty_seed: int = 42
+
+    # Columns that identify a single race. Every car in a race shares its
+    # circuit, weather and safety-car history, and finishing positions are a
+    # permutation within it - so splitting a race across train and test leaks.
+    GROUP_COLUMNS = ('year', 'round')
+
     def _load_config(self, config_path: str) -> Dict:
         """Load configuration, falling back to the built-in hyperparameters."""
         try:
@@ -60,57 +78,120 @@ class F1ModelTrainer:
         if missing_features:
             logger.warning(f"Missing features: {missing_features}")
         
+        if not available_features:
+            raise ValueError(
+                "None of the requested feature columns are present in the dataset"
+            )
+        if target_column not in df.columns:
+            raise ValueError(f"Target column '{target_column}' is not in the dataset")
+
         self.feature_columns = available_features
-        
+
         # Remove rows with missing target
         df_clean = df.dropna(subset=[target_column])
-        
+        if df_clean.empty:
+            raise ValueError(
+                f"No rows left after dropping missing '{target_column}' values"
+            )
+
         # Fill missing features with appropriate values
         X = df_clean[available_features].copy()
         y = df_clean[target_column].copy()
-        
+
         # Fill NaN with column means
         X = X.fillna(X.mean())
-        
+
         # Replace any remaining NaN/inf
         X = X.replace([np.inf, -np.inf], np.nan)
         X = X.fillna(0)
-        
+
+        # Record which race each row belongs to, aligned with the filtered rows.
+        if all(column in df_clean.columns for column in self.GROUP_COLUMNS):
+            self.groups = (
+                df_clean[list(self.GROUP_COLUMNS)]
+                .astype(str)
+                .agg('_'.join, axis=1)
+                .to_numpy()
+            )
+        else:
+            logger.warning(
+                f"Columns {self.GROUP_COLUMNS} unavailable; falling back to a "
+                "row-level split, which lets a race straddle train and test"
+            )
+            self.groups = None
+
         return X.values, y.values
-    
+
+    def _split(self,
+               X: np.ndarray,
+               y: np.ndarray,
+               groups: Optional[np.ndarray],
+               test_size: float,
+               random_state: int):
+        """
+        Hold out whole races where possible.
+
+        A random row split puts 19 of a race's 20 cars in training and the 20th
+        in test. Finishing position is a ranking within the race, so the model
+        is then scored on a race it has almost entirely memorised.
+        """
+        if groups is not None and len(np.unique(groups)) > 1:
+            splitter = GroupShuffleSplit(
+                n_splits=1, test_size=test_size, random_state=random_state
+            )
+            train_idx, test_idx = next(splitter.split(X, y, groups=groups))
+            return X[train_idx], X[test_idx], y[train_idx], y[test_idx]
+
+        return train_test_split(X, y, test_size=test_size, random_state=random_state)
+
     def train(self, X: np.ndarray, y: np.ndarray,
              model_type: str = None,
              test_size: float = 0.2,
-             cross_validate: bool = True) -> Dict[str, float]:
+             cross_validate: bool = True,
+             groups: Optional[np.ndarray] = None) -> Dict[str, float]:
         """
         Train the model.
-        
+
         Args:
             X: Feature matrix
             y: Target vector
             model_type: 'xgboost', 'random_forest', or 'ensemble'
             test_size: Proportion for test set
             cross_validate: Whether to perform cross-validation
-            
+            groups: Race key per row; defaults to what `prepare_data` recorded.
+                Whole races are held out together so a race's other 19 cars are
+                never visible while scoring the 20th.
+
         Returns:
             Dictionary of evaluation metrics
         """
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float)
+        if X.ndim != 2 or len(X) != len(y):
+            raise ValueError(f"X {X.shape} and y {y.shape} are not aligned")
+        if len(X) < 5:
+            raise ValueError(f"Need at least 5 samples to train, got {len(X)}")
+
         model_config = self.config.get('model', {})
         self.model_type = model_type or model_config.get('type', 'xgboost')
-        
-        # Scale features
-        X_scaled = self.scaler.fit_transform(X)
-        
-        # Split data
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_scaled, y, 
-            test_size=test_size, 
-            random_state=model_config.get('random_state', 42)
+        random_state = model_config.get('random_state', 42)
+
+        if groups is None and self.groups is not None and len(self.groups) == len(y):
+            groups = self.groups
+
+        # Split first, then scale. Fitting the scaler on the full matrix leaks
+        # the test set's mean and variance into training.
+        X_train_raw, X_test_raw, y_train, y_test = self._split(
+            X, y, groups, test_size, random_state
         )
-        
+
+        self.scaler = StandardScaler()
+        X_train = self.scaler.fit_transform(X_train_raw)
+        X_test = self.scaler.transform(X_test_raw)
+
         logger.info(f"Training {self.model_type} model...")
         logger.info(f"Training samples: {len(X_train)}, Test samples: {len(X_test)}")
-        
+
         # Build model
         if self.model_type == 'xgboost':
             self.model = self._build_xgboost(model_config.get('xgboost', {}))
@@ -120,32 +201,77 @@ class F1ModelTrainer:
             self.model = self._build_ensemble(model_config)
         else:
             raise ValueError(f"Unknown model type: {self.model_type}")
-        
+
         # Train
         self.model.fit(X_train, y_train)
-        
+
         # Evaluate
         y_pred = self.model.predict(X_test)
-        
+
         metrics = self._calculate_metrics(y_test, y_pred)
-        
+
         # Cross-validation
         if cross_validate:
-            cv_folds = model_config.get('cv_folds', 5)
-            cv_scores = cross_val_score(
-                self.model, X_scaled, y, 
-                cv=cv_folds, 
-                scoring='neg_mean_absolute_error'
+            cv_metrics = self._cross_validate(
+                X, y, groups, model_config.get('cv_folds', 5)
             )
-            metrics['cv_mae_mean'] = -cv_scores.mean()
-            metrics['cv_mae_std'] = cv_scores.std()
-            logger.info(f"Cross-validation MAE: {metrics['cv_mae_mean']:.3f} (+/- {metrics['cv_mae_std']:.3f})")
-        
+            metrics.update(cv_metrics)
+
         # Feature importance
         self._extract_feature_importance()
-        
+
         return metrics
-    
+
+    def _cross_validate(self,
+                        X: np.ndarray,
+                        y: np.ndarray,
+                        groups: Optional[np.ndarray],
+                        cv_folds: int) -> Dict[str, float]:
+        """
+        Cross-validate with the scaler inside the fold.
+
+        The scaler has to be refit per fold, otherwise every fold's held-out
+        rows have already contributed their mean and variance to the transform.
+        """
+        # Each fold needs an untouched estimator, and the scaler must be refit
+        # inside the fold rather than shared across folds.
+        fold_model = self._clone_model()
+        pipeline = Pipeline([('scaler', StandardScaler()), ('model', fold_model)])
+
+        if groups is not None:
+            n_groups = len(np.unique(groups))
+            if n_groups < 2:
+                logger.warning("Only one race in the dataset; skipping cross-validation")
+                return {}
+            splitter = GroupKFold(n_splits=min(cv_folds, n_groups))
+        else:
+            splitter = KFold(n_splits=min(cv_folds, len(y)), shuffle=True, random_state=42)
+            groups = None
+
+        cv_scores = cross_val_score(
+            pipeline, X, y,
+            groups=groups,
+            cv=splitter,
+            scoring='neg_mean_absolute_error',
+        )
+
+        logger.info(
+            f"Cross-validation MAE: {-cv_scores.mean():.3f} (+/- {cv_scores.std():.3f})"
+        )
+        return {
+            'cv_mae_mean': float(-cv_scores.mean()),
+            'cv_mae_std': float(cv_scores.std()),
+        }
+
+    def _clone_model(self):
+        """A fresh, unfitted estimator of the configured type."""
+        model_config = self.config.get('model', {})
+        if self.model_type == 'random_forest':
+            return self._build_random_forest(model_config.get('random_forest', {}))
+        if self.model_type == 'ensemble':
+            return self._build_ensemble(model_config)
+        return self._build_xgboost(model_config.get('xgboost', {}))
+
     def _build_xgboost(self, params: Dict) -> xgb.XGBRegressor:
         """Build XGBoost model."""
         default_params = {
@@ -297,16 +423,26 @@ class F1ModelTrainer:
         return np.clip(predictions, 1, 20), std
     
     def _estimate_uncertainty_perturbation(self, X: np.ndarray, n_samples: int = 50) -> np.ndarray:
-        """Estimate uncertainty by perturbing inputs."""
+        """
+        Estimate uncertainty by perturbing inputs.
+
+        Uses a fixed generator so two `--predict` runs over the same model and
+        grid report the same uncertainty; the global numpy state used to make
+        every run differ.
+        """
+        if n_samples < 2:
+            raise ValueError(f"Need at least 2 perturbation samples, got {n_samples}")
+
         noise_level = 0.05
+        rng = np.random.default_rng(self.uncertainty_seed)
         all_preds = []
-        
+
         for _ in range(n_samples):
-            noise = np.random.normal(0, noise_level, X.shape)
+            noise = rng.normal(0, noise_level, X.shape)
             X_noisy = X + noise
             preds = self.model.predict(X_noisy)
             all_preds.append(preds)
-        
+
         return np.std(all_preds, axis=0)
     
     def hyperparameter_tuning(self, X: np.ndarray, y: np.ndarray) -> Dict:
@@ -363,6 +499,7 @@ class F1ModelTrainer:
             'target_column': self.target_column,
             'model_type': self.model_type,
             'feature_importance': self.feature_importance,
+            'uncertainty_seed': self.uncertainty_seed,
         }
         
         joblib.dump(model_data, output_path)
@@ -378,6 +515,7 @@ class F1ModelTrainer:
         self.target_column = model_data['target_column']
         self.model_type = model_data['model_type']
         self.feature_importance = model_data['feature_importance']
+        self.uncertainty_seed = model_data.get('uncertainty_seed', 42)
         
         logger.info(f"Model loaded from {path}")
 

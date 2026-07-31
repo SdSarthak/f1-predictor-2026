@@ -124,3 +124,92 @@ def test_save_and_load_round_trip(prepared, tmp_path):
     assert reloaded.feature_columns == trainer.feature_columns
     assert reloaded.model_type == trainer.model_type
     np.testing.assert_allclose(reloaded.predict(X[:5]), expected)
+
+
+def _race_groups(df):
+    return df[['year', 'round']].astype(str).agg('_'.join, axis=1).to_numpy()
+
+
+def test_prepare_data_records_the_race_each_row_belongs_to(prepared, engineered):
+    trainer, X, y = prepared
+    df, _ = engineered
+
+    assert trainer.groups is not None
+    assert len(trainer.groups) == len(y)
+    assert set(trainer.groups) == set(_race_groups(df))
+
+
+def test_whole_races_are_held_out_together(prepared):
+    """
+    A row-level split leaves 19 of a race's 20 cars in training while the 20th
+    is scored, and finishing position is a permutation within the race.
+    """
+    trainer, X, y = prepared
+    groups = trainer.groups
+
+    X_train, X_test, y_train, y_test = trainer._split(
+        X, y, groups, test_size=0.25, random_state=42)
+
+    assert len(X_train) + len(X_test) == len(X)
+
+    # Recover which groups landed on each side by matching rows back.
+    lookup = {tuple(row): group for row, group in zip(X.tolist(), groups)}
+    train_groups = {lookup[tuple(row)] for row in X_train.tolist()}
+    test_groups = {lookup[tuple(row)] for row in X_test.tolist()}
+
+    assert test_groups
+    assert not (train_groups & test_groups)
+
+
+def test_the_scaler_is_fitted_on_training_rows_only(prepared):
+    """
+    Fitting StandardScaler on the whole matrix leaks the held-out mean and
+    variance into training.
+    """
+    trainer, X, y = prepared
+    trainer.train(X, y, model_type='random_forest', cross_validate=False, test_size=0.25)
+
+    full_mean = X.mean(axis=0)
+    fitted_mean = trainer.scaler.mean_
+
+    assert fitted_mean.shape == full_mean.shape
+    # The scaler saw a strict subset, so its mean must differ from the full matrix
+    # on at least one feature with real spread.
+    spread = X.std(axis=0) > 0
+    assert not np.allclose(fitted_mean[spread], full_mean[spread])
+
+
+def test_cross_validation_groups_by_race(prepared):
+    trainer, X, y = prepared
+
+    metrics = trainer.train(X, y, model_type='random_forest', cross_validate=True)
+
+    assert 'cv_mae_mean' in metrics
+    assert metrics['cv_mae_mean'] > 0
+    assert metrics['cv_mae_std'] >= 0
+
+
+def test_training_rejects_misaligned_or_tiny_inputs(config_path):
+    trainer = F1ModelTrainer(config_path)
+
+    with pytest.raises(ValueError, match="not aligned"):
+        trainer.train(np.zeros((10, 3)), np.zeros(9), cross_validate=False)
+
+    with pytest.raises(ValueError, match="at least 5 samples"):
+        trainer.train(np.zeros((3, 3)), np.zeros(3), cross_validate=False)
+
+
+def test_prepare_data_rejects_an_unusable_dataset(engineered, config_path):
+    df, engineer = engineered
+    trainer = F1ModelTrainer(config_path)
+
+    with pytest.raises(ValueError, match="None of the requested feature columns"):
+        trainer.prepare_data(df, ['nope', 'also_nope'])
+
+    with pytest.raises(ValueError, match="not in the dataset"):
+        trainer.prepare_data(df, engineer.get_feature_columns(), target_column='missing')
+
+    blank = df.copy()
+    blank['finish_position'] = np.nan
+    with pytest.raises(ValueError, match="No rows left"):
+        trainer.prepare_data(blank, engineer.get_feature_columns())
